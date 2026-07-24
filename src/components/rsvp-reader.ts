@@ -27,6 +27,8 @@ import {
 	applyBionicReading,
 	extractPdfPageText,
 	loadPdfJs,
+	type PdfOutlineEntry,
+	resolvePdfOutline,
 } from "../services/text-parser.js";
 import { applyTheme } from "../services/theme-service.js";
 import { trackEvent, wpmBracket } from "../utils/analytics.js";
@@ -73,6 +75,17 @@ export class RsvpReader extends LitElement {
 	private _pdfPageObservers = new Map<Element, IntersectionObserver>();
 	/** Intersection ratio of every actually-visible page (no rootMargin), used to pick the "current" page for the pager. */
 	private _pdfVisibleRatios = new Map<number, number>();
+	/**
+	 * True while a deliberate jump's smooth-scroll animation is still in
+	 * flight. Pages transiting through the tight viewport mid-animation would
+	 * otherwise fight the jump — the visibility observer fires repeatedly on
+	 * whatever page briefly fills the screen as it scrolls past, overwriting
+	 * pdfPageNum away from the intended target until the scroll finally
+	 * settles. Suppressing pdfPageNum updates until settle means a jump always
+	 * wins outright instead of racing its own animation.
+	 */
+	private _pdfProgrammaticScroll = false;
+	private _pdfScrollSettleTimer: ReturnType<typeof setTimeout> | null = null;
 	@state() private showPageJumpModal = false;
 	@state() private pageJumpLoading = false;
 	@state() private pageJumpTokens: WordToken[] = [];
@@ -83,6 +96,11 @@ export class RsvpReader extends LitElement {
 	@state() private pdfSearchMatches: number[] = [];
 	@state() private pdfSearchActiveIndex = -1;
 	@state() private pdfSearchLoading = false;
+	@state() private showChaptersPanel = false;
+	/** Whether the current PDF has a resolvable outline — drives the Chapters button's disabled state. */
+	@state() private pdfHasOutline = false;
+	/** Resolved outline for the currently loaded PDF, fetched once per document like _pdfPageTextCache below. */
+	private _pdfOutline: PdfOutlineEntry[] = [];
 	/** Extracted page text, cached so re-searching or re-opening the jump-to-reader modal doesn't re-extract the same page. */
 	private _pdfPageTextCache = new Map<number, string>();
 	private _pdfSearchedQuery = "";
@@ -314,6 +332,8 @@ export class RsvpReader extends LitElement {
 		this._disconnectPdfObservers();
 		this.pdfDocProxy?.destroy();
 		this.pdfDocProxy = null;
+		this._pdfOutline = [];
+		this.pdfHasOutline = false;
 	}
 
 	protected override updated(
@@ -403,7 +423,10 @@ export class RsvpReader extends LitElement {
 		this.showPdfViewer = false;
 		this._closePageJumpModal();
 		this._closePdfSearch();
+		this._closeChaptersPanel();
 		this._pdfPageTextCache.clear();
+		this._pdfOutline = [];
+		this.pdfHasOutline = false;
 		this.docTitle = doc.title;
 		this.totalDocWords = doc.wordCount;
 		this.rawDocText = doc.text;
@@ -613,6 +636,18 @@ export class RsvpReader extends LitElement {
 			const firstPage = await this.pdfDocProxy.getPage(1);
 			const unscaled = firstPage.getViewport({ scale: 1 });
 			this.pdfPageAspectRatio = unscaled.height / unscaled.width;
+
+			// Fire-and-forget: resolving dest→page for every outline entry must
+			// not block first paint or observer setup below.
+			void resolvePdfOutline(this.pdfDocProxy)
+				.then((outline) => {
+					this._pdfOutline = outline;
+					this.pdfHasOutline = outline.length > 0;
+				})
+				.catch(() => {
+					this._pdfOutline = [];
+					this.pdfHasOutline = false;
+				});
 		}
 		await this.updateComplete;
 		this._setupPdfObservers();
@@ -658,6 +693,11 @@ export class RsvpReader extends LitElement {
 			observer.disconnect();
 		this._pdfPageObservers.clear();
 		this._pdfVisibleRatios.clear();
+		this._pdfProgrammaticScroll = false;
+		if (this._pdfScrollSettleTimer) {
+			clearTimeout(this._pdfScrollSettleTimer);
+			this._pdfScrollSettleTimer = null;
+		}
 	}
 
 	private _onPdfPagePrefetchIntersect(
@@ -698,7 +738,9 @@ export class RsvpReader extends LitElement {
 				bestPage = page;
 			}
 		}
-		if (bestPage !== null) this.pdfPageNum = bestPage;
+		if (bestPage !== null && !this._pdfProgrammaticScroll) {
+			this.pdfPageNum = bestPage;
+		}
 	}
 
 	private async _renderPdfPageInto(
@@ -747,15 +789,47 @@ export class RsvpReader extends LitElement {
 		// (e.g. opening the jump-to-reader modal right after a search) can
 		// read the page we're navigating away from instead of the target.
 		this.pdfPageNum = clamped;
-		const containers = this.renderRoot.querySelectorAll<HTMLElement>(
-			".pdf-scroll-container",
-		);
-		for (const container of Array.from(containers)) {
-			if (container.clientWidth === 0) continue;
+		const containers = Array.from(
+			this.renderRoot.querySelectorAll<HTMLElement>(".pdf-scroll-container"),
+		).filter((container) => container.clientWidth > 0);
+		this._suppressPdfPageTrackingUntilSettled(containers, clamped);
+		for (const container of containers) {
 			const slot = container.querySelector<HTMLElement>(
 				`.pdf-page-slot[data-page="${clamped}"]`,
 			);
 			slot?.scrollIntoView({ behavior: "smooth", block: "start" });
+		}
+	}
+
+	/**
+	 * While the scroll triggered by a jump is animating, pages transiting the
+	 * tight viewport would otherwise fight the jump via the visibility
+	 * observer (see `_pdfProgrammaticScroll`). Suppress pdfPageNum updates
+	 * until the browser reports the scroll has actually settled (`scrollend`,
+	 * with a timeout fallback for engines that don't fire it), then
+	 * re-assert the intended target once more in case the observer's last
+	 * delivered ratios were still mid-transit.
+	 */
+	private _suppressPdfPageTrackingUntilSettled(
+		containers: HTMLElement[],
+		target: number,
+	): void {
+		this._pdfProgrammaticScroll = true;
+		if (this._pdfScrollSettleTimer) clearTimeout(this._pdfScrollSettleTimer);
+
+		const settle = () => {
+			this._pdfProgrammaticScroll = false;
+			this.pdfPageNum = target;
+			if (this._pdfScrollSettleTimer) {
+				clearTimeout(this._pdfScrollSettleTimer);
+				this._pdfScrollSettleTimer = null;
+			}
+		};
+		// Fallback in case `scrollend` isn't supported, or never fires (e.g.
+		// the target was already fully in view and nothing actually scrolled).
+		this._pdfScrollSettleTimer = setTimeout(settle, 1000);
+		for (const container of containers) {
+			container.addEventListener("scrollend", settle, { once: true });
 		}
 	}
 
@@ -906,6 +980,21 @@ export class RsvpReader extends LitElement {
 		void this.persistProgress(this.engine.getState());
 		showToast(`Jumped to page ${this.pdfPageNum}`, "success");
 		this._closePageJumpModal();
+	}
+
+	private _openChaptersPanel(): void {
+		if (!this.pdfHasOutline) return;
+		this.showChaptersPanel = true;
+	}
+
+	private _closeChaptersPanel(): void {
+		this.showChaptersPanel = false;
+	}
+
+	private _jumpToOutlineEntry(entry: PdfOutlineEntry): void {
+		if (entry.page === null) return;
+		this._jumpToPdfPage(entry.page);
+		this._closeChaptersPanel();
 	}
 
 	/**
@@ -1481,9 +1570,22 @@ export class RsvpReader extends LitElement {
 							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
 						</svg>
 					</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle"
+						?disabled=${!this.pdfHasOutline}
+						@click=${() => this._openChaptersPanel()}
+						title=${this.pdfHasOutline ? "Chapters" : "No chapters found in this PDF"}
+						aria-label="Chapters"
+					>
+						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 6h16M4 12h9M4 18h9"/>
+						</svg>
+					</button>
 				</div>
 			</div>
 			${this.showPageJumpModal ? this.renderPageJumpModal() : ""}
+			${this.showChaptersPanel ? this.renderChaptersModal() : ""}
 		`;
 	}
 
@@ -1572,6 +1674,64 @@ export class RsvpReader extends LitElement {
 				</div>
 			</div>
 		`;
+	}
+
+	private renderChaptersModal() {
+		return html`
+			<div
+				class="fixed inset-0 bg-base-content/50 z-50 flex items-center justify-center p-4"
+				@click=${() => this._closeChaptersPanel()}
+				aria-hidden="true"
+			>
+				<div
+					class="card bg-base-100 w-full max-w-lg shadow-xl max-h-[85vh] flex flex-col"
+					@click=${(e: Event) => e.stopPropagation()}
+					role="dialog"
+					aria-label="Chapters"
+				>
+					<div class="card-body overflow-hidden flex flex-col">
+						<div class="flex items-center justify-between mb-1">
+							<h3 class="font-medium text-base-content">Chapters</h3>
+							<button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" @click=${() => this._closeChaptersPanel()}>
+								<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+								</svg>
+							</button>
+						</div>
+						<div class="flex-1 overflow-y-auto border border-base-200 rounded-lg p-2 text-sm">
+							${
+								this._pdfOutline.length === 0
+									? html`<p class="text-xs text-base-content/50 p-2">No chapters found in this PDF.</p>`
+									: this._renderOutlineEntries(this._pdfOutline, 0)
+							}
+						</div>
+					</div>
+				</div>
+			</div>
+		`;
+	}
+
+	private _renderOutlineEntries(
+		entries: PdfOutlineEntry[],
+		depth: number,
+	): unknown {
+		return entries.map(
+			(entry) => html`
+				<div>
+					<div
+						class="py-1 px-2 truncate rounded transition-colors duration-100 ${
+							entry.page !== null
+								? "cursor-pointer hover:bg-primary/20"
+								: "opacity-40 cursor-not-allowed"
+						}"
+						style="padding-left: ${Math.min(depth, 6) * 14 + 8}px"
+						title=${entry.page === null ? "This chapter has no linked page." : ""}
+						@click=${() => this._jumpToOutlineEntry(entry)}
+					>${entry.title}</div>
+					${entry.children.length > 0 ? this._renderOutlineEntries(entry.children, depth + 1) : ""}
+				</div>
+			`,
+		);
 	}
 
 	private renderEmptyState() {

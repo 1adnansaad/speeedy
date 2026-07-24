@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 import {
 	applyBionicReading,
 	createDocFromText,
+	type PdfOutlineNode,
 	parseFile,
+	resolvePdfOutline,
 } from "./text-parser.js";
 
 describe("applyBionicReading", () => {
@@ -137,5 +139,115 @@ describe("createDocFromText", () => {
 		const doc = createDocFromText("   \n\n   ");
 		expect(doc.text).toBe("");
 		expect(doc.wordCount).toBe(0);
+	});
+});
+
+describe("resolvePdfOutline", () => {
+	// Minimal fake matching the pdf.js surface resolvePdfOutline actually calls.
+	function fakePdfDoc(overrides: {
+		outline: PdfOutlineNode[] | null;
+		destinations?: Record<string, unknown[] | null>;
+		pageIndexOf?: (ref: unknown) => number;
+		failPageIndex?: boolean;
+	}) {
+		return {
+			getOutline: async () => overrides.outline,
+			getDestination: async (id: string) =>
+				overrides.destinations?.[id] ?? null,
+			getPageIndex: async (ref: unknown) => {
+				if (overrides.failPageIndex) throw new Error("bad ref");
+				return overrides.pageIndexOf ? overrides.pageIndexOf(ref) : 0;
+			},
+		};
+	}
+
+	it("returns an empty array when the PDF has no outline", async () => {
+		const result = await resolvePdfOutline(fakePdfDoc({ outline: null }));
+		expect(result).toEqual([]);
+	});
+
+	it("resolves an array dest directly via getPageIndex", async () => {
+		const doc = fakePdfDoc({
+			outline: [{ title: "Chapter 1", dest: ["ref-1"], url: null, items: [] }],
+			pageIndexOf: () => 4,
+		});
+		const result = await resolvePdfOutline(doc);
+		expect(result).toEqual([{ title: "Chapter 1", page: 5, children: [] }]);
+	});
+
+	it("resolves a string dest via getDestination first", async () => {
+		const doc = fakePdfDoc({
+			outline: [
+				{ title: "Chapter 2", dest: "named-dest", url: null, items: [] },
+			],
+			destinations: { "named-dest": ["ref-2"] },
+			pageIndexOf: () => 9,
+		});
+		const result = await resolvePdfOutline(doc);
+		expect(result).toEqual([{ title: "Chapter 2", page: 10, children: [] }]);
+	});
+
+	it("resolves nested items and preserves order", async () => {
+		const doc = fakePdfDoc({
+			outline: [
+				{
+					title: "Part I",
+					dest: ["ref-part1"],
+					url: null,
+					items: [
+						{ title: "Ch 1", dest: ["ref-ch1"], url: null, items: [] },
+						{ title: "Ch 2", dest: ["ref-ch2"], url: null, items: [] },
+					],
+				},
+			],
+			pageIndexOf: (ref) => {
+				if (ref === "ref-part1") return 0;
+				if (ref === "ref-ch1") return 1;
+				return 5;
+			},
+		});
+		const result = await resolvePdfOutline(doc);
+		expect(result).toEqual([
+			{
+				title: "Part I",
+				page: 1,
+				children: [
+					{ title: "Ch 1", page: 2, children: [] },
+					{ title: "Ch 2", page: 6, children: [] },
+				],
+			},
+		]);
+	});
+
+	it("leaves page null for an external-link entry with no dest", async () => {
+		const doc = fakePdfDoc({
+			outline: [
+				{
+					title: "External link",
+					dest: null,
+					url: "https://example.com",
+					items: [],
+				},
+			],
+		});
+		const result = await resolvePdfOutline(doc);
+		expect(result).toEqual([
+			{ title: "External link", page: null, children: [] },
+		]);
+	});
+
+	it("degrades a single unresolvable entry to page: null without throwing", async () => {
+		const doc = fakePdfDoc({
+			outline: [
+				{ title: "Broken", dest: ["bad-ref"], url: null, items: [] },
+				{ title: "Fine", dest: ["good-ref"], url: null, items: [] },
+			],
+			failPageIndex: true,
+		});
+		const result = await resolvePdfOutline(doc);
+		expect(result).toEqual([
+			{ title: "Broken", page: null, children: [] },
+			{ title: "Fine", page: null, children: [] },
+		]);
 	});
 });

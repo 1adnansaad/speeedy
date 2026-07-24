@@ -292,6 +292,62 @@ export async function loadPdfJs() {
 	return pdfjs;
 }
 
+export interface PdfOutlineEntry {
+	title: string;
+	/** 1-based page number; null if the entry's destination couldn't be resolved to a page (or it's an external-url-only entry). */
+	page: number | null;
+	children: PdfOutlineEntry[];
+}
+
+export interface PdfOutlineNode {
+	title: string;
+	dest: string | unknown[] | null;
+	url: string | null;
+	items: unknown[];
+}
+
+interface PdfOutlineSource {
+	getOutline(): Promise<PdfOutlineNode[] | null>;
+	getDestination(id: string): Promise<unknown[] | null>;
+	getPageIndex(ref: unknown): Promise<number>;
+}
+
+/**
+ * Resolves a PDF's real embedded outline/bookmarks (as opposed to the
+ * heuristic ChapterInfo/extractPdfChapters text anchors above) into a page
+ * number per entry, for jumping the PDF page viewer directly to a chapter.
+ */
+export async function resolvePdfOutline(
+	pdfDoc: PdfOutlineSource,
+): Promise<PdfOutlineEntry[]> {
+	const raw = await pdfDoc.getOutline();
+	if (!raw || raw.length === 0) return [];
+
+	async function resolveNode(node: PdfOutlineNode): Promise<PdfOutlineEntry> {
+		let page: number | null = null;
+		try {
+			if (node.dest) {
+				const destArray =
+					typeof node.dest === "string"
+						? await pdfDoc.getDestination(node.dest)
+						: node.dest;
+				const ref = destArray?.[0];
+				if (ref !== undefined && ref !== null) {
+					page = (await pdfDoc.getPageIndex(ref)) + 1;
+				}
+			}
+		} catch {
+			page = null;
+		}
+		const children = await Promise.all(
+			((node.items ?? []) as PdfOutlineNode[]).map(resolveNode),
+		);
+		return { title: node.title, page, children };
+	}
+
+	return Promise.all(raw.map(resolveNode));
+}
+
 async function parsePdf(file: File): Promise<ParsedDocument> {
 	const { getDocument } = await loadPdfJs();
 	const arrayBuffer = await file.arrayBuffer();
