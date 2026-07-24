@@ -76,6 +76,14 @@ export class RsvpReader extends LitElement {
 	@state() private pageJumpTokens: WordToken[] = [];
 	@state() private pageJumpWordTarget = 3;
 	@state() private pageJumpAnchorStart: number | null = null;
+	@state() private showPdfSearch = false;
+	@state() private pdfSearchQuery = "";
+	@state() private pdfSearchMatches: number[] = [];
+	@state() private pdfSearchActiveIndex = -1;
+	@state() private pdfSearchLoading = false;
+	/** Extracted page text, cached so re-searching or re-opening the jump-to-reader modal doesn't re-extract the same page. */
+	private _pdfPageTextCache = new Map<number, string>();
+	private _pdfSearchedQuery = "";
 	private wasPlayingBeforeSeek = false;
 	private countdownTimer: ReturnType<typeof setTimeout> | null = null;
 	private seekingPointerId: number | null = null;
@@ -392,6 +400,8 @@ export class RsvpReader extends LitElement {
 		this.pdfPageAspectRatio = 1.4;
 		this.showPdfViewer = false;
 		this._closePageJumpModal();
+		this._closePdfSearch();
+		this._pdfPageTextCache.clear();
 		this.docTitle = doc.title;
 		this.totalDocWords = doc.wordCount;
 		this.rawDocText = doc.text;
@@ -588,6 +598,7 @@ export class RsvpReader extends LitElement {
 		this.showPdfViewer = false;
 		this._disconnectPdfObservers();
 		this._closePageJumpModal();
+		this._closePdfSearch();
 	}
 
 	private async _ensurePdfLoaded(): Promise<void> {
@@ -711,17 +722,116 @@ export class RsvpReader extends LitElement {
 		}
 	}
 
+	/** Extracts (or reuses a cached copy of) one page's plain text — shared by the jump-to-reader modal and PDF search. */
+	private async _getPdfPageText(pageNum: number): Promise<string> {
+		const cached = this._pdfPageTextCache.get(pageNum);
+		if (cached !== undefined) return cached;
+		if (!this.pdfDocProxy) return "";
+		const page = await this.pdfDocProxy.getPage(pageNum);
+		const text = await extractPdfPageText(page);
+		this._pdfPageTextCache.set(pageNum, text);
+		return text;
+	}
+
+	/** Token indices matching the last-run "Find in PDF" query, so the jump modal can echo the search highlight. */
+	private _pdfSearchMatchTokenIndices(): Set<number> {
+		const result = new Set<number>();
+		const queryWords = this._pdfSearchedQuery
+			.trim()
+			.toLowerCase()
+			.split(/\s+/)
+			.filter(Boolean);
+		if (queryWords.length === 0) return result;
+		const tokens = this.pageJumpTokens;
+		for (let start = 0; start <= tokens.length - queryWords.length; start++) {
+			let matched = true;
+			for (let k = 0; k < queryWords.length; k++) {
+				if (!tokens[start + k].text.toLowerCase().includes(queryWords[k])) {
+					matched = false;
+					break;
+				}
+			}
+			if (matched) {
+				for (let k = 0; k < queryWords.length; k++) result.add(start + k);
+			}
+		}
+		return result;
+	}
+
 	private async _openPageJumpModal(): Promise<void> {
 		if (!this.pdfDocProxy) return;
 		this.showPageJumpModal = true;
 		this.pageJumpLoading = true;
 		this.pageJumpAnchorStart = null;
 		try {
-			const page = await this.pdfDocProxy.getPage(this.pdfPageNum);
-			const pageText = await extractPdfPageText(page);
+			const pageText = await this._getPdfPageText(this.pdfPageNum);
 			this.pageJumpTokens = tokenize(pageText, this.settings);
 		} finally {
 			this.pageJumpLoading = false;
+		}
+	}
+
+	private _togglePdfSearch(): void {
+		this.showPdfSearch = !this.showPdfSearch;
+		if (!this.showPdfSearch) return;
+		requestAnimationFrame(() => {
+			this.renderRoot
+				.querySelector<HTMLInputElement>(".pdf-search-input")
+				?.focus();
+		});
+	}
+
+	private _closePdfSearch(): void {
+		this.showPdfSearch = false;
+		this.pdfSearchQuery = "";
+		this.pdfSearchMatches = [];
+		this.pdfSearchActiveIndex = -1;
+		this._pdfSearchedQuery = "";
+	}
+
+	private async _runPdfSearch(): Promise<void> {
+		const query = this.pdfSearchQuery.trim().toLowerCase();
+		this._pdfSearchedQuery = this.pdfSearchQuery.trim();
+		if (!query || !this.pdfDocProxy || this.pdfPageCount === 0) {
+			this.pdfSearchMatches = [];
+			this.pdfSearchActiveIndex = -1;
+			return;
+		}
+		this.pdfSearchLoading = true;
+		const matches: number[] = [];
+		try {
+			for (let n = 1; n <= this.pdfPageCount; n++) {
+				const text = await this._getPdfPageText(n);
+				if (text.toLowerCase().includes(query)) matches.push(n);
+			}
+		} finally {
+			this.pdfSearchLoading = false;
+		}
+		this.pdfSearchMatches = matches;
+		this.pdfSearchActiveIndex = matches.length > 0 ? 0 : -1;
+		if (matches.length > 0) {
+			this._jumpToPdfPage(matches[0]);
+		} else {
+			showToast("No matches found in this PDF.", "error");
+		}
+	}
+
+	private _cyclePdfSearchMatch(delta: number): void {
+		const count = this.pdfSearchMatches.length;
+		if (count === 0) return;
+		this.pdfSearchActiveIndex =
+			(this.pdfSearchActiveIndex + delta + count) % count;
+		this._jumpToPdfPage(this.pdfSearchMatches[this.pdfSearchActiveIndex]);
+	}
+
+	private _handlePdfSearchEnter(shiftKey: boolean): void {
+		if (
+			this.pdfSearchMatches.length > 0 &&
+			this._pdfSearchedQuery === this.pdfSearchQuery.trim()
+		) {
+			this._cyclePdfSearchMatch(shiftKey ? -1 : 1);
+		} else {
+			void this._runPdfSearch();
 		}
 	}
 
@@ -1217,48 +1327,124 @@ export class RsvpReader extends LitElement {
 							)
 				}
 			</div>
-			<div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-base-200 shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-				<button
-					type="button"
-					class="btn btn-ghost btn-sm btn-circle"
-					?disabled=${this.pdfPageNum <= 1}
-					@click=${() => this._jumpToPdfPage(this.pdfPageNum - 1)}
-					aria-label="Previous page"
-				>‹</button>
-				<input
-					type="number"
-					class="input input-xs input-bordered w-14 text-center font-mono"
-					min="1"
-					max="${this.pdfPageCount}"
-					.value=${String(this.pdfPageNum)}
-					@keydown=${(e: KeyboardEvent) => {
-						if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-					}}
-					@change=${(e: Event) => {
-						this._jumpToPdfPage(Number((e.target as HTMLInputElement).value));
-					}}
-					aria-label="Page number"
-				/>
-				<span class="text-xs font-mono text-base-content/60">of ${this.pdfPageCount}</span>
-				<button
-					type="button"
-					class="btn btn-ghost btn-sm btn-circle"
-					?disabled=${this.pdfPageNum >= this.pdfPageCount}
-					@click=${() => this._jumpToPdfPage(this.pdfPageNum + 1)}
-					aria-label="Next page"
-				>›</button>
-				<button
-					type="button"
-					class="btn btn-ghost btn-sm btn-circle"
-					?disabled=${this.pdfPageCount === 0}
-					@click=${() => void this._openPageJumpModal()}
-					title="Jump reader to this page"
-					aria-label="Jump reader to this page"
+			<div class="relative shrink-0">
+				<div
+					class="pdf-search-drawer absolute bottom-full left-0 right-0 bg-base-100 border-t border-base-200 shadow-lg p-2 flex items-center gap-1.5 z-10 transition-all duration-150 ${
+						this.showPdfSearch
+							? "translate-y-0 opacity-100"
+							: "translate-y-2 opacity-0 pointer-events-none"
+					}"
 				>
-					<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+					<svg class="w-4 h-4 opacity-50 shrink-0 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
 					</svg>
-				</button>
+					<input
+						type="text"
+						class="pdf-search-input input input-xs input-bordered flex-1 min-w-0"
+						placeholder="Find in PDF…"
+						.value=${this.pdfSearchQuery}
+						@input=${(e: Event) => {
+							this.pdfSearchQuery = (e.target as HTMLInputElement).value;
+						}}
+						@keydown=${(e: KeyboardEvent) => {
+							if (e.key === "Enter") {
+								e.preventDefault();
+								this._handlePdfSearchEnter(e.shiftKey);
+							} else if (e.key === "Escape") {
+								this._closePdfSearch();
+							}
+						}}
+					/>
+					${
+						this.pdfSearchLoading
+							? html`<span class="loading loading-spinner loading-xs shrink-0"></span>`
+							: this.pdfSearchMatches.length > 0
+								? html`<span class="text-xs font-mono text-base-content/60 shrink-0 whitespace-nowrap">${this.pdfSearchActiveIndex + 1} of ${this.pdfSearchMatches.length}</span>`
+								: this._pdfSearchedQuery
+									? html`<span class="text-xs text-base-content/40 shrink-0 whitespace-nowrap">No matches</span>`
+									: ""
+					}
+					<button
+						type="button"
+						class="btn btn-ghost btn-xs btn-circle shrink-0"
+						?disabled=${this.pdfSearchMatches.length === 0}
+						@click=${() => this._cyclePdfSearchMatch(-1)}
+						aria-label="Previous match"
+					>‹</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-xs btn-circle shrink-0"
+						?disabled=${this.pdfSearchMatches.length === 0}
+						@click=${() => this._cyclePdfSearchMatch(1)}
+						aria-label="Next match"
+					>›</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-xs btn-circle shrink-0"
+						@click=${() => this._closePdfSearch()}
+						aria-label="Close search"
+					>
+						<svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+						</svg>
+					</button>
+				</div>
+				<div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-base-200 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle"
+						?disabled=${this.pdfPageNum <= 1}
+						@click=${() => this._jumpToPdfPage(this.pdfPageNum - 1)}
+						aria-label="Previous page"
+					>‹</button>
+					<input
+						type="number"
+						class="input input-xs input-bordered w-14 text-center font-mono"
+						min="1"
+						max="${this.pdfPageCount}"
+						.value=${String(this.pdfPageNum)}
+						@keydown=${(e: KeyboardEvent) => {
+							if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+						}}
+						@change=${(e: Event) => {
+							this._jumpToPdfPage(Number((e.target as HTMLInputElement).value));
+						}}
+						aria-label="Page number"
+					/>
+					<span class="text-xs font-mono text-base-content/60">of ${this.pdfPageCount}</span>
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle"
+						?disabled=${this.pdfPageNum >= this.pdfPageCount}
+						@click=${() => this._jumpToPdfPage(this.pdfPageNum + 1)}
+						aria-label="Next page"
+					>›</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle"
+						?disabled=${this.pdfPageCount === 0}
+						@click=${() => void this._openPageJumpModal()}
+						title="Jump reader to this page"
+						aria-label="Jump reader to this page"
+					>
+						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+						</svg>
+					</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle ${this.showPdfSearch ? "bg-base-200" : ""}"
+						?disabled=${this.pdfPageCount === 0}
+						@click=${() => this._togglePdfSearch()}
+						title="Find in PDF"
+						aria-label="${this.showPdfSearch ? "Close find in PDF" : "Find in PDF"}"
+						aria-expanded="${this.showPdfSearch}"
+					>
+						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
+						</svg>
+					</button>
+				</div>
 			</div>
 			${this.showPageJumpModal ? this.renderPageJumpModal() : ""}
 		`;
