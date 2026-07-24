@@ -1,6 +1,7 @@
 import { html, LitElement, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import type {
 	ParsedDocument,
 	ReaderSettings,
@@ -11,11 +12,12 @@ import { DEFAULT_SETTINGS } from "../services/defaults.js";
 import { type PlaybackState, RSVPEngine } from "../services/rsvp-engine.js";
 import { recordSession } from "../services/stats-service.js";
 import {
+	getSavedDocument,
 	getSavedDocuments,
 	saveDocument,
 	updateDocumentProgress,
 } from "../services/storage-service.js";
-import { applyBionicReading } from "../services/text-parser.js";
+import { applyBionicReading, loadPdfJs } from "../services/text-parser.js";
 import { applyTheme } from "../services/theme-service.js";
 import { trackEvent, wpmBracket } from "../utils/analytics.js";
 import { emitProfileUpdated, navigate, showToast } from "../utils/events.js";
@@ -48,6 +50,12 @@ export class RsvpReader extends LitElement {
 	@state() private isProgressHovered = false;
 	@state() private isSeeking = false;
 	@state() private seekWordIndex: number | null = null;
+	@state() private showPdfViewer = false;
+	@state() private pdfBlob: Blob | null = null;
+	@state() private pdfPageNum = 1;
+	@state() private pdfPageCount = 0;
+	@state() private pdfPageRendering = false;
+	private pdfDocProxy: PDFDocumentProxy | null = null;
 	private wasPlayingBeforeSeek = false;
 	private countdownTimer: ReturnType<typeof setTimeout> | null = null;
 	private seekingPointerId: number | null = null;
@@ -212,6 +220,7 @@ export class RsvpReader extends LitElement {
 			if (this.savedDocId) {
 				localStorage.setItem("speeedy:last-doc-id", this.savedDocId);
 			}
+			void this._loadPdfSourceIfAny();
 		} else {
 			void this.restoreLastDocument();
 		}
@@ -242,6 +251,18 @@ export class RsvpReader extends LitElement {
 			wordCount: docToLoad.wordCount,
 			chapters: docToLoad.chapters,
 		});
+		void this._loadPdfSourceIfAny();
+	}
+
+	/** Looks up the saved document's original file and, if it's a PDF, keeps the blob around for the PDF viewer sidebar. */
+	private async _loadPdfSourceIfAny(): Promise<void> {
+		if (!this.savedDocId) return;
+		const saved = await getSavedDocument(this.savedDocId);
+		if (!saved?.sourceFile) return;
+		const isPdf =
+			saved.sourceMimeType === "application/pdf" ||
+			saved.sourceFileName?.toLowerCase().endsWith(".pdf");
+		if (isPdf) this.pdfBlob = saved.sourceFile;
 	}
 
 	override disconnectedCallback(): void {
@@ -260,6 +281,8 @@ export class RsvpReader extends LitElement {
 			this.handleVisibilityChange,
 		);
 		document.removeEventListener("paste", this.handleGlobalPaste);
+		this.pdfDocProxy?.destroy();
+		this.pdfDocProxy = null;
 	}
 
 	protected override updated(
@@ -339,6 +362,12 @@ export class RsvpReader extends LitElement {
 	private static readonly RESUME_LOOKBACK_WORDS = 12;
 
 	private loadDoc(doc: ParsedDocument): void {
+		this.pdfDocProxy?.destroy();
+		this.pdfDocProxy = null;
+		this.pdfBlob = null;
+		this.pdfPageCount = 0;
+		this.pdfPageNum = 1;
+		this.showPdfViewer = false;
 		this.docTitle = doc.title;
 		this.totalDocWords = doc.wordCount;
 		this.rawDocText = doc.text;
@@ -517,6 +546,60 @@ export class RsvpReader extends LitElement {
 		}
 	};
 
+	private _togglePdfViewer(): void {
+		if (this.showPdfViewer) {
+			this.showPdfViewer = false;
+			return;
+		}
+		this.showSettings = false;
+		this.showPdfViewer = true;
+		void this._ensurePdfLoaded();
+	}
+
+	private async _ensurePdfLoaded(): Promise<void> {
+		if (!this.pdfDocProxy && this.pdfBlob) {
+			const { getDocument } = await loadPdfJs();
+			const arrayBuffer = await this.pdfBlob.arrayBuffer();
+			this.pdfDocProxy = await getDocument({ data: arrayBuffer }).promise;
+			this.pdfPageCount = this.pdfDocProxy.numPages;
+			this.pdfPageNum = 1;
+		}
+		await this.updateComplete;
+		requestAnimationFrame(() => void this._renderPdfPage(this.pdfPageNum));
+	}
+
+	private async _goToPdfPage(delta: number): Promise<void> {
+		const next = this.pdfPageNum + delta;
+		if (next < 1 || next > this.pdfPageCount) return;
+		this.pdfPageNum = next;
+		await this._renderPdfPage(next);
+	}
+
+	/** Renders one page into every `.pdf-canvas` currently mounted (desktop sidebar and/or mobile sheet). */
+	private async _renderPdfPage(pageNum: number): Promise<void> {
+		const doc = this.pdfDocProxy;
+		if (!doc) return;
+		this.pdfPageRendering = true;
+		try {
+			const page = await doc.getPage(pageNum);
+			const canvases =
+				this.renderRoot.querySelectorAll<HTMLCanvasElement>(".pdf-canvas");
+			const unscaledViewport = page.getViewport({ scale: 1 });
+			for (const canvas of Array.from(canvases)) {
+				const containerWidth = canvas.parentElement?.clientWidth || 320;
+				const scale = Math.max(0.1, containerWidth / unscaledViewport.width);
+				const viewport = page.getViewport({ scale });
+				const ctx = canvas.getContext("2d");
+				if (!ctx) continue;
+				canvas.width = viewport.width;
+				canvas.height = viewport.height;
+				await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+			}
+		} finally {
+			this.pdfPageRendering = false;
+		}
+	}
+
 	private seekRatioFromPointerEvent(e: PointerEvent): number {
 		const bar = e.currentTarget as HTMLElement;
 		const rect = bar.getBoundingClientRect();
@@ -689,11 +772,31 @@ export class RsvpReader extends LitElement {
 									d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
 							</svg>
 						</button>
+						${
+							this.pdfBlob
+								? html`
+						<button
+							type="button"
+							class="btn btn-ghost btn-md btn-circle min-h-[44px] min-w-[44px] touch-manipulation ${this.showPdfViewer ? "bg-base-200" : ""}"
+							@click=${() => this._togglePdfViewer()}
+							title="View PDF"
+							aria-label="${this.showPdfViewer ? "Close PDF viewer" : "Open PDF viewer"}"
+							aria-expanded="${this.showPdfViewer}"
+						>
+							<svg class="w-5 h-5 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+									d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+							</svg>
+						</button>
+						`
+								: ""
+						}
 						<button
 							type="button"
 							class="btn btn-ghost btn-md btn-circle min-h-[44px] min-w-[44px] touch-manipulation ${this.showSettings ? "bg-base-200" : ""}"
 							data-umami-event="settings-opened"
 							@click=${() => {
+								this.showPdfViewer = false;
 								this.showSettings = !this.showSettings;
 							}}
 							title="Settings"
@@ -815,6 +918,19 @@ export class RsvpReader extends LitElement {
 			`
 			}
 
+			<!-- PDF Sidebar (RIGHT, desktop only) -->
+			${
+				focusModeActive
+					? nothing
+					: html`
+			<div class="hidden md:flex transition-all duration-300 ${this.showPdfViewer ? "w-80 border-l border-base-200" : "w-0"} overflow-hidden shrink-0 bg-base-100 flex-col relative z-40">
+				<div class="w-80 flex flex-col h-full overflow-hidden">
+					${this.renderPdfPanel()}
+				</div>
+			</div>
+			`
+			}
+
 			</div>
 
 		<!-- Settings Bottom Sheet (mobile only) -->
@@ -854,8 +970,70 @@ export class RsvpReader extends LitElement {
 				: ""
 		}
 
+		<!-- PDF Bottom Sheet (mobile only) -->
+		${
+			!focusModeActive && this.showPdfViewer
+				? html`
+			<div class="md:hidden fixed inset-0 z-40 flex flex-col justify-end">
+				<!-- Backdrop -->
+				<div
+					class="absolute inset-0 bg-base-content/40"
+					@click=${() => {
+						this.showPdfViewer = false;
+					}}
+					aria-hidden="true"
+				></div>
+				<!-- Sheet -->
+				<div class="relative bg-base-100 rounded-t-2xl max-h-[80vh] flex flex-col shadow-2xl z-10 w-full" role="dialog" aria-label="PDF viewer">
+					${this.renderPdfPanel()}
+				</div>
+			</div>
+			`
+				: ""
+		}
+
 			<!-- Shortcuts Modal -->
 			${this.showShortcuts ? this.renderShortcutsModal() : ""}
+		`;
+	}
+
+	private renderPdfPanel() {
+		return html`
+			<div class="px-5 py-4 border-b border-base-200 flex items-center justify-between shrink-0">
+				<span class="text-sm font-medium text-base-content/70 tracking-wide truncate">${this.docTitle || "Document"}</span>
+				<button class="btn btn-ghost btn-sm btn-circle" aria-label="Close PDF viewer" @click=${() => {
+					this.showPdfViewer = false;
+				}}>
+					<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+					</svg>
+				</button>
+			</div>
+			<div class="flex-1 overflow-auto flex items-start justify-center p-3 bg-base-200/40 relative">
+				${
+					this.pdfPageRendering
+						? html`<span class="loading loading-spinner loading-md absolute top-8"></span>`
+						: ""
+				}
+				<canvas class="pdf-canvas max-w-full shadow"></canvas>
+			</div>
+			<div class="flex items-center justify-center gap-3 px-4 py-3 border-t border-base-200 shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+				<button
+					type="button"
+					class="btn btn-ghost btn-sm btn-circle"
+					?disabled=${this.pdfPageNum <= 1}
+					@click=${() => this._goToPdfPage(-1)}
+					aria-label="Previous page"
+				>‹</button>
+				<span class="text-xs font-mono text-base-content/60">Page ${this.pdfPageNum} of ${this.pdfPageCount}</span>
+				<button
+					type="button"
+					class="btn btn-ghost btn-sm btn-circle"
+					?disabled=${this.pdfPageNum >= this.pdfPageCount}
+					@click=${() => this._goToPdfPage(1)}
+					aria-label="Next page"
+				>›</button>
+			</div>
 		`;
 	}
 

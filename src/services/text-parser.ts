@@ -263,11 +263,24 @@ interface PdfDocumentLike {
 	}>;
 }
 
-async function parsePdf(file: File): Promise<ParsedDocument> {
-	const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-	const workerUrl = await import("pdfjs-dist/legacy/build/pdf.worker.mjs?url");
-	GlobalWorkerOptions.workerSrc = workerUrl.default;
+/**
+ * Lazily loads pdfjs-dist and points it at its worker script, once per page
+ * load. Shared by text extraction and by the PDF page viewer so the worker
+ * is only ever configured a single time.
+ */
+export async function loadPdfJs() {
+	const pdfjs = await import("pdfjs-dist");
+	if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+		const workerUrl = await import(
+			"pdfjs-dist/legacy/build/pdf.worker.mjs?url"
+		);
+		pdfjs.GlobalWorkerOptions.workerSrc = workerUrl.default;
+	}
+	return pdfjs;
+}
 
+async function parsePdf(file: File): Promise<ParsedDocument> {
+	const { getDocument } = await loadPdfJs();
 	const arrayBuffer = await file.arrayBuffer();
 	const pdf = await getDocument({ data: arrayBuffer }).promise;
 

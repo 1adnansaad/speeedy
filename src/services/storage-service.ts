@@ -137,6 +137,13 @@ export async function getSavedDocuments(): Promise<SavedDocument[]> {
 	return docs.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
+export async function getSavedDocument(
+	id: string,
+): Promise<SavedDocument | undefined> {
+	const db = await getDb();
+	return (await db.get(DOCS_STORE, id)) as SavedDocument | undefined;
+}
+
 async function hashContent(text: string): Promise<string> {
 	const buf = await crypto.subtle.digest(
 		"SHA-256",
