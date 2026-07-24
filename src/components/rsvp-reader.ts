@@ -67,9 +67,11 @@ export class RsvpReader extends LitElement {
 	/** height/width of an unscaled page, used to reserve correct scroll space for pages that haven't rendered yet. */
 	@state() private pdfPageAspectRatio = 1.4;
 	private pdfDocProxy: PDFDocumentProxy | null = null;
-	/** One IntersectionObserver per mounted scroll container (desktop sidebar and/or mobile sheet). */
+	/** One wide-margin IntersectionObserver per mounted scroll container, used only to prefetch/evict page canvases. */
 	private _pdfObservers = new Map<Element, IntersectionObserver>();
-	/** Intersection ratio of every currently visible page, used to pick the "current" page for the pager. */
+	/** One viewport-only IntersectionObserver per mounted scroll container, used to detect the actual current page. */
+	private _pdfPageObservers = new Map<Element, IntersectionObserver>();
+	/** Intersection ratio of every actually-visible page (no rootMargin), used to pick the "current" page for the pager. */
 	private _pdfVisibleRatios = new Map<number, number>();
 	@state() private showPageJumpModal = false;
 	@state() private pageJumpLoading = false;
@@ -616,45 +618,75 @@ export class RsvpReader extends LitElement {
 		this._setupPdfObservers();
 	}
 
-	/** Attaches one IntersectionObserver per mounted scroll container (desktop sidebar / mobile sheet), skipping ones already wired up. */
+	/** Attaches the prefetch/eviction and current-page observers to each mounted scroll container (desktop sidebar / mobile sheet), skipping ones already wired up. */
 	private _setupPdfObservers(): void {
 		const containers = this.renderRoot.querySelectorAll<HTMLElement>(
 			".pdf-scroll-container",
 		);
 		for (const container of Array.from(containers)) {
 			if (this._pdfObservers.has(container)) continue;
-			const observer = new IntersectionObserver(
-				(entries) => this._onPdfPageIntersect(entries),
-				{ root: container, rootMargin: "150% 0px", threshold: [0, 0.5, 1] },
-			);
-			for (const slot of Array.from(
+			const slots = Array.from(
 				container.querySelectorAll<HTMLElement>(".pdf-page-slot"),
-			)) {
-				observer.observe(slot);
-			}
-			this._pdfObservers.set(container, observer);
+			);
+
+			// Wide margin so nearby pages render/evict before they scroll into
+			// view — intentionally NOT used to pick the current page, since a
+			// page fully inside this oversized margin reports ratio 1 even
+			// when it's nowhere near actually visible.
+			const prefetchObserver = new IntersectionObserver(
+				(entries) => this._onPdfPagePrefetchIntersect(entries),
+				{ root: container, rootMargin: "150% 0px", threshold: [0] },
+			);
+			for (const slot of slots) prefetchObserver.observe(slot);
+			this._pdfObservers.set(container, prefetchObserver);
+
+			// Tight (no) margin, purely to detect which page is actually on
+			// screen so the pager stays in sync with what's visible.
+			const pageObserver = new IntersectionObserver(
+				(entries) => this._onPdfPageVisibilityIntersect(entries),
+				{ root: container, threshold: [0, 0.25, 0.5, 0.75, 1] },
+			);
+			for (const slot of slots) pageObserver.observe(slot);
+			this._pdfPageObservers.set(container, pageObserver);
 		}
 	}
 
 	private _disconnectPdfObservers(): void {
 		for (const observer of this._pdfObservers.values()) observer.disconnect();
 		this._pdfObservers.clear();
+		for (const observer of this._pdfPageObservers.values())
+			observer.disconnect();
+		this._pdfPageObservers.clear();
 		this._pdfVisibleRatios.clear();
 	}
 
-	private _onPdfPageIntersect(entries: IntersectionObserverEntry[]): void {
+	private _onPdfPagePrefetchIntersect(
+		entries: IntersectionObserverEntry[],
+	): void {
 		for (const entry of entries) {
 			const slot = entry.target as HTMLElement;
 			const pageNum = Number(slot.dataset.page);
 			if (!pageNum) continue;
 			if (entry.isIntersecting) {
-				this._pdfVisibleRatios.set(pageNum, entry.intersectionRatio);
 				void this._renderPdfPageInto(pageNum, slot);
+			} else if (
+				Math.abs(pageNum - this.pdfPageNum) > RsvpReader.PDF_KEEP_WINDOW
+			) {
+				this._evictPdfPage(slot);
+			}
+		}
+	}
+
+	private _onPdfPageVisibilityIntersect(
+		entries: IntersectionObserverEntry[],
+	): void {
+		for (const entry of entries) {
+			const pageNum = Number((entry.target as HTMLElement).dataset.page);
+			if (!pageNum) continue;
+			if (entry.isIntersecting) {
+				this._pdfVisibleRatios.set(pageNum, entry.intersectionRatio);
 			} else {
 				this._pdfVisibleRatios.delete(pageNum);
-				if (Math.abs(pageNum - this.pdfPageNum) > RsvpReader.PDF_KEEP_WINDOW) {
-					this._evictPdfPage(slot);
-				}
 			}
 		}
 
@@ -710,6 +742,11 @@ export class RsvpReader extends LitElement {
 
 	private _jumpToPdfPage(target: number): void {
 		const clamped = Math.max(1, Math.min(this.pdfPageCount, target));
+		// Set immediately rather than waiting on the IntersectionObserver to
+		// notice the scroll has settled — otherwise a quick follow-up action
+		// (e.g. opening the jump-to-reader modal right after a search) can
+		// read the page we're navigating away from instead of the target.
+		this.pdfPageNum = clamped;
 		const containers = this.renderRoot.querySelectorAll<HTMLElement>(
 			".pdf-scroll-container",
 		);
