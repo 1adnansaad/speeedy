@@ -88,6 +88,7 @@ export class ProfilePage extends LitElement {
 			wordCount: doc.wordCount,
 			resumeWordIndex: 0,
 			completionPercent: 0,
+			chapters: doc.chapters,
 		});
 		this.savedDocs = await getSavedDocuments();
 		this.docUploadError = "";

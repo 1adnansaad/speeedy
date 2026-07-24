@@ -240,6 +240,7 @@ export class RsvpReader extends LitElement {
 			title: docToLoad.title,
 			text: docToLoad.text,
 			wordCount: docToLoad.wordCount,
+			chapters: docToLoad.chapters,
 		});
 	}
 

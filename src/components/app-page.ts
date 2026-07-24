@@ -2,6 +2,7 @@ import { html, LitElement } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { BookOpen, Clipboard, Clock, Edit2, Play, Trash2 } from "lucide";
 import type {
+	ChapterInfo,
 	ParsedDocument,
 	SavedDocument,
 	ThemeName,
@@ -40,6 +41,10 @@ export class AppPage extends LitElement {
 	@state() private inputTab: "file" | "text" = "file";
 	@state() private loadedDocTitle = "";
 	@state() private loadedDocText = "";
+	@state() private loadedDocChapters: ChapterInfo[] | undefined = undefined;
+	@state() private loadedDocSourceFile: Blob | undefined = undefined;
+	@state() private loadedDocSourceFileName: string | undefined = undefined;
+	@state() private loadedDocSourceMimeType: string | undefined = undefined;
 	@state() private customTitle = "";
 	@state() private savedDocs: SavedDocument[] = [];
 	@state() private welcomeDismissed = false;
@@ -99,6 +104,9 @@ export class AppPage extends LitElement {
 		this.pastedText = text;
 		this.loadedDocTitle = "";
 		this.loadedDocText = "";
+		this.loadedDocSourceFile = undefined;
+		this.loadedDocSourceFileName = undefined;
+		this.loadedDocSourceMimeType = undefined;
 		this.customTitle = "";
 		this.inputTab = "text";
 		this.error = "";
@@ -120,6 +128,9 @@ export class AppPage extends LitElement {
 			this.pastedText = text.trim();
 			this.loadedDocTitle = "";
 			this.loadedDocText = "";
+			this.loadedDocSourceFile = undefined;
+			this.loadedDocSourceFileName = undefined;
+			this.loadedDocSourceMimeType = undefined;
 			this.customTitle = "";
 			this.error = "";
 			showToast("Clipboard loaded ✓", "success");
@@ -137,6 +148,10 @@ export class AppPage extends LitElement {
 		this.pastedText = doc.text;
 		this.loadedDocTitle = doc.title;
 		this.loadedDocText = doc.text;
+		this.loadedDocChapters = doc.chapters;
+		this.loadedDocSourceFile = doc.sourceFile;
+		this.loadedDocSourceFileName = doc.sourceFileName;
+		this.loadedDocSourceMimeType = doc.sourceMimeType;
 		this.customTitle = doc.title;
 		this.error = "";
 		this.inputTab = "text";
@@ -163,12 +178,19 @@ export class AppPage extends LitElement {
 		const isModified =
 			this.loadedDocText.length > 0 && text !== this.loadedDocText;
 		const title = isModified ? `${baseTitle} – modified` : baseTitle;
+		// Chapter anchors were extracted from the original text — if the user
+		// edited it before starting, the anchors may no longer be valid substrings.
+		const chapters = isModified ? undefined : this.loadedDocChapters;
 		const saved = await saveDocument({
 			title,
 			text,
 			wordCount,
 			resumeWordIndex: 0,
 			completionPercent: 0,
+			chapters,
+			sourceFile: this.loadedDocSourceFile,
+			sourceFileName: this.loadedDocSourceFileName,
+			sourceMimeType: this.loadedDocSourceMimeType,
 		});
 		trackEvent("reader-opened", {
 			source: this.loadedDocTitle ? "file" : "paste",
@@ -176,11 +198,20 @@ export class AppPage extends LitElement {
 		});
 		this.loadedDocTitle = "";
 		this.loadedDocText = "";
+		this.loadedDocChapters = undefined;
+		this.loadedDocSourceFile = undefined;
+		this.loadedDocSourceFileName = undefined;
+		this.loadedDocSourceMimeType = undefined;
 		this.customTitle = "";
 		this.pastedText = "";
 		navigate(
 			"reader",
-			{ title: saved.title, text: saved.text, wordCount: saved.wordCount },
+			{
+				title: saved.title,
+				text: saved.text,
+				wordCount: saved.wordCount,
+				chapters: saved.chapters,
+			},
 			saved.id,
 			saved.resumeWordIndex,
 		);
@@ -391,6 +422,9 @@ export class AppPage extends LitElement {
 		this.pastedText = DEMO_TEXT;
 		this.loadedDocTitle = "Demo: The Science of Speed Reading";
 		this.loadedDocText = DEMO_TEXT;
+		this.loadedDocSourceFile = undefined;
+		this.loadedDocSourceFileName = undefined;
+		this.loadedDocSourceMimeType = undefined;
 		this.customTitle = "Demo: The Science of Speed Reading";
 		trackEvent("demo-loaded");
 	}
@@ -475,6 +509,9 @@ export class AppPage extends LitElement {
 								this.pastedText = "";
 								this.loadedDocTitle = "";
 								this.loadedDocText = "";
+								this.loadedDocSourceFile = undefined;
+								this.loadedDocSourceFileName = undefined;
+								this.loadedDocSourceMimeType = undefined;
 								this.customTitle = "";
 							}}>Clear</button>
             `
@@ -576,6 +613,9 @@ export class AppPage extends LitElement {
 							this.pastedText = doc.text;
 							this.loadedDocTitle = doc.title;
 							this.loadedDocText = doc.text;
+							this.loadedDocSourceFile = doc.sourceFile;
+							this.loadedDocSourceFileName = doc.sourceFileName;
+							this.loadedDocSourceMimeType = doc.sourceMimeType;
 							this.inputTab = "text";
 							window.scrollTo({ top: 0, behavior: "smooth" });
 						}}

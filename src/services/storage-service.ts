@@ -161,6 +161,10 @@ export async function saveDocument(
 			const updated: SavedDocument = {
 				...existing,
 				savedAt: new Date().toISOString(),
+				// Attach the source file if this save brought one and the existing record didn't have one yet.
+				sourceFile: existing.sourceFile ?? doc.sourceFile,
+				sourceFileName: existing.sourceFileName ?? doc.sourceFileName,
+				sourceMimeType: existing.sourceMimeType ?? doc.sourceMimeType,
 			};
 			await db.put(DOCS_STORE, updated);
 			return updated;

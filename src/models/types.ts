@@ -149,10 +149,28 @@ export interface UserProfile {
 	donationNudgeDismissedAtSessionCount?: number;
 }
 
+/**
+ * A detected chapter/section heading. `anchorText` is the literal heading
+ * text as it appears in `ParsedDocument.text` — resolving a chapter to a
+ * position at runtime is just `text.indexOf(anchorText)`, no offsets to
+ * keep in sync with edits or re-tokenization.
+ */
+export interface ChapterInfo {
+	title: string;
+	anchorText: string;
+}
+
 export interface ParsedDocument {
 	title: string;
 	text: string;
 	wordCount: number;
+	chapters?: ChapterInfo[];
+	/** Original uploaded file bytes, kept alongside the extracted text for later use (e.g. re-parsing, export, preview). Absent for pasted/typed text. */
+	sourceFile?: Blob;
+	/** Original filename, e.g. "report.pdf". */
+	sourceFileName?: string;
+	/** Original file MIME type, e.g. "application/pdf". */
+	sourceMimeType?: string;
 }
 
 export interface SavedDocument {
@@ -165,6 +183,13 @@ export interface SavedDocument {
 	completionPercent: number;
 	/** SHA-256 hash of text for deduplication; optional for legacy docs. */
 	contentHash?: string;
+	chapters?: ChapterInfo[];
+	/** Original uploaded file bytes, stored alongside the extracted text for later use. Absent for pasted/typed text or legacy docs saved before this existed. */
+	sourceFile?: Blob;
+	/** Original filename, e.g. "report.pdf". */
+	sourceFileName?: string;
+	/** Original file MIME type, e.g. "application/pdf". */
+	sourceMimeType?: string;
 }
 
 export interface OrpResult {

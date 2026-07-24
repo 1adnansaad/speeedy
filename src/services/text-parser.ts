@@ -1,5 +1,5 @@
 import type JSZip from "jszip";
-import type { ParsedDocument } from "../models/types.js";
+import type { ChapterInfo, ParsedDocument } from "../models/types.js";
 import { countWords, htmlToPlainText } from "../utils/text-utils.js";
 
 type JSZipStatic = typeof JSZip;
@@ -77,6 +77,16 @@ function findZipEntry(zip: JSZip, path: string): JSZip.JSZipObject | null {
 }
 
 export async function parseFile(file: File): Promise<ParsedDocument> {
+	const doc = await parseFileToDocument(file);
+	return {
+		...doc,
+		sourceFile: file,
+		sourceFileName: file.name,
+		sourceMimeType: file.type || undefined,
+	};
+}
+
+async function parseFileToDocument(file: File): Promise<ParsedDocument> {
 	const ext = file.name.split(".").pop()?.toLowerCase();
 
 	if (ext === "pdf") return parsePdf(file);
@@ -127,6 +137,132 @@ async function parsePlainText(file: File): Promise<ParsedDocument> {
 	};
 }
 
+interface PdfLine {
+	text: string;
+	/** Largest font size among the items making up this line. */
+	fontSize: number;
+}
+
+/**
+ * Groups a page's raw text items into visual lines, the same way for every
+ * caller: a big vertical jump starts a new line, and a horizontal gap on the
+ * same line gets a space inserted (pdf.js text items don't preserve word
+ * breaks on their own). Shared by `extractPdfText` and `extractPdfChapters`
+ * so heading text detected for a chapter anchor is byte-for-byte the same
+ * string that ends up in the final document text.
+ */
+function buildPdfPageLines(
+	items: Array<{ str?: string; transform?: number[] }>,
+): PdfLine[] {
+	let lastY: number | null = null;
+	let lastX: number | null = null;
+	let lineFontSize = 0;
+	const lineBuffer: string[] = [];
+	const lines: PdfLine[] = [];
+
+	const flushLine = () => {
+		if (lineBuffer.length > 0) {
+			lines.push({ text: lineBuffer.join(""), fontSize: lineFontSize });
+			lineBuffer.length = 0;
+			lineFontSize = 0;
+		}
+	};
+
+	for (const item of items) {
+		const str = item.str;
+		if (!str) continue;
+
+		const transform = item.transform;
+		const x = transform?.[4] ?? 0;
+		const y = transform?.[5] ?? 0;
+		const fontSize = transform?.[0] ?? 12;
+
+		if (lastY !== null && Math.abs(y - lastY) > fontSize * 0.5) {
+			flushLine();
+		} else if (
+			lastX !== null &&
+			x - lastX > fontSize * 0.3 &&
+			lineBuffer.length > 0
+		) {
+			const last = lineBuffer[lineBuffer.length - 1];
+			if (last && !last.endsWith(" ")) lineBuffer.push(" ");
+		}
+
+		lineBuffer.push(str);
+		lineFontSize = Math.max(lineFontSize, fontSize);
+		lastY = y;
+		lastX = x + str.length * fontSize * 0.5;
+	}
+
+	flushLine();
+	return lines;
+}
+
+function hasStr(item: unknown): item is { str: string; transform?: number[] } {
+	return typeof item === "object" && item !== null && "str" in item;
+}
+
+async function extractPdfText(pdf: PdfDocumentLike): Promise<string> {
+	const pageParts: string[] = [];
+	for (let i = 1; i <= pdf.numPages; i++) {
+		const page = await pdf.getPage(i);
+		const content = await page.getTextContent();
+		const lines = buildPdfPageLines(content.items.filter(hasStr));
+		pageParts.push(lines.map((l) => l.text).join("\n"));
+	}
+	return cleanText(pageParts.join("\n\n"));
+}
+
+const CHAPTER_HEADING_PATTERN =
+	/^(chapter|part|book|section|prologue|epilogue|introduction|preface|appendix)\b/i;
+
+/**
+ * Detects chapter/section headings on each page — either a short line in a
+ * noticeably larger font than the rest of the page (a typical heading
+ * style), or a line starting with a chapter-like keyword. Deliberately
+ * simple: no PDF outline/bookmark resolution, just font size + keyword
+ * heuristics, since the anchor only needs to be a literal substring of the
+ * final text, not a precise structural model of the document.
+ */
+async function extractPdfChapters(
+	pdf: PdfDocumentLike,
+): Promise<ChapterInfo[]> {
+	const chapters: ChapterInfo[] = [];
+	const seen = new Set<string>();
+
+	for (let i = 1; i <= pdf.numPages; i++) {
+		const page = await pdf.getPage(i);
+		const content = await page.getTextContent();
+		const lines = buildPdfPageLines(content.items.filter(hasStr));
+		if (lines.length === 0) continue;
+
+		const sizes = [...lines.map((l) => l.fontSize)].sort((a, b) => a - b);
+		const bodyFontSize = sizes[Math.floor(sizes.length / 2)] || 12;
+
+		for (const line of lines) {
+			const text = line.text.replace(/[ \t]{2,}/g, " ").trim();
+			if (!text || text.length > 80) continue;
+
+			const isLargeHeading = line.fontSize >= bodyFontSize * 1.3;
+			const matchesKeyword = CHAPTER_HEADING_PATTERN.test(text);
+			if (!isLargeHeading && !matchesKeyword) continue;
+			if (seen.has(text)) continue;
+
+			seen.add(text);
+			chapters.push({ title: text, anchorText: text });
+		}
+	}
+
+	return chapters;
+}
+
+interface PdfDocumentLike {
+	numPages: number;
+	getPage(pageNumber: number): Promise<{
+		getTextContent(): Promise<{ items: unknown[] }>;
+	}>;
+}
+
 async function parsePdf(file: File): Promise<ParsedDocument> {
 	const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
 	const workerUrl = await import("pdfjs-dist/legacy/build/pdf.worker.mjs?url");
@@ -134,55 +270,20 @@ async function parsePdf(file: File): Promise<ParsedDocument> {
 
 	const arrayBuffer = await file.arrayBuffer();
 	const pdf = await getDocument({ data: arrayBuffer }).promise;
-	const pageParts: string[] = [];
 
-	for (let i = 1; i <= pdf.numPages; i++) {
-		const page = await pdf.getPage(i);
-		const content = await page.getTextContent();
+	// Text extraction and chapter detection are independent passes over the
+	// same pages — run them concurrently rather than interleaving them into
+	// one pass, so each stays simple on its own.
+	const [text, chapters] = await Promise.all([
+		extractPdfText(pdf),
+		extractPdfChapters(pdf),
+	]);
 
-		let lastY: number | null = null;
-		let lastX: number | null = null;
-		const lineBuffer: string[] = [];
-		const lines: string[] = [];
-
-		for (const item of content.items) {
-			if (!("str" in item)) continue;
-			const str = (item as { str: string }).str;
-			if (!str) continue;
-
-			const transform = (item as { transform?: number[] }).transform;
-			const x = transform?.[4] ?? 0;
-			const y = transform?.[5] ?? 0;
-			const fontSize = transform?.[0] ?? 12;
-
-			if (lastY !== null && Math.abs(y - lastY) > fontSize * 0.5) {
-				if (lineBuffer.length > 0) {
-					lines.push(lineBuffer.join(""));
-					lineBuffer.length = 0;
-				}
-			} else if (
-				lastX !== null &&
-				x - lastX > fontSize * 0.3 &&
-				lineBuffer.length > 0
-			) {
-				const last = lineBuffer[lineBuffer.length - 1];
-				if (last && !last.endsWith(" ")) lineBuffer.push(" ");
-			}
-
-			lineBuffer.push(str);
-			lastY = y;
-			lastX = x + str.length * fontSize * 0.5;
-		}
-
-		if (lineBuffer.length > 0) lines.push(lineBuffer.join(""));
-		pageParts.push(lines.join("\n"));
-	}
-
-	const text = cleanText(pageParts.join("\n\n"));
 	return {
 		title: file.name.replace(/\.pdf$/i, ""),
 		text,
 		wordCount: countWords(text),
+		chapters: chapters.length > 0 ? chapters : undefined,
 	};
 }
 
