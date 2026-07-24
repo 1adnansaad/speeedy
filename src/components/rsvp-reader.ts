@@ -1454,6 +1454,7 @@ export class RsvpReader extends LitElement {
 		const anchorStart = this.pageJumpAnchorStart;
 		const anchorEnd =
 			anchorStart !== null ? anchorStart + this.pageJumpWordTarget : null;
+		const searchMatchIndices = this._pdfSearchMatchTokenIndices();
 		return html`
 			<div
 				class="fixed inset-0 bg-base-content/50 z-50 flex items-center justify-center p-4"
@@ -1477,6 +1478,11 @@ export class RsvpReader extends LitElement {
 						</div>
 						<p class="text-xs text-base-content/50 mb-2">
 							Click the first word of a passage below — the reader will jump to where that text appears.
+							${
+								searchMatchIndices.size > 0
+									? html`<span class="ml-1">Highlighted in <span class="bg-warning/40 rounded px-0.5">yellow</span>: your search for "${this._pdfSearchedQuery}".</span>`
+									: ""
+							}
 						</p>
 						<div class="flex items-center gap-2 mb-3">
 							<label class="text-xs text-base-content/60 shrink-0" for="page-jump-word-count">Match length</label>
@@ -1506,7 +1512,9 @@ export class RsvpReader extends LitElement {
 													i >= anchorStart &&
 													i < (anchorEnd ?? 0)
 														? "bg-primary/30 text-primary font-medium"
-														: ""
+														: searchMatchIndices.has(i)
+															? "bg-warning/40"
+															: ""
 												}"
 												@click=${() => {
 													this.pageJumpAnchorStart = i;
