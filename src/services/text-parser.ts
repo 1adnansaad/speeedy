@@ -1,4 +1,5 @@
 import type JSZip from "jszip";
+import type { PDFPageProxy } from "pdfjs-dist";
 import type { ChapterInfo, ParsedDocument } from "../models/types.js";
 import { countWords, htmlToPlainText } from "../utils/text-utils.js";
 
@@ -211,6 +212,18 @@ async function extractPdfText(pdf: PdfDocumentLike): Promise<string> {
 		pageParts.push(lines.map((l) => l.text).join("\n"));
 	}
 	return cleanText(pageParts.join("\n\n"));
+}
+
+/**
+ * Extracts one page's plain text, using the exact same line-building and
+ * cleanup pipeline as full-document extraction, so the result is guaranteed
+ * to appear as a literal substring of a `ParsedDocument.text` built from the
+ * same PDF (e.g. for a "find this page's text in the reader" jump feature).
+ */
+export async function extractPdfPageText(page: PDFPageProxy): Promise<string> {
+	const content = await page.getTextContent();
+	const lines = buildPdfPageLines((content.items as unknown[]).filter(hasStr));
+	return cleanText(lines.map((l) => l.text).join("\n"));
 }
 
 const CHAPTER_HEADING_PATTERN =

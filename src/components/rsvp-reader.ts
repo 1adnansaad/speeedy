@@ -1,5 +1,6 @@
 import { html, LitElement, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
+import { repeat } from "lit/directives/repeat.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import type {
@@ -9,7 +10,12 @@ import type {
 } from "../models/types.js";
 import { audioService } from "../services/audio-service.js";
 import { DEFAULT_SETTINGS } from "../services/defaults.js";
-import { type PlaybackState, RSVPEngine } from "../services/rsvp-engine.js";
+import {
+	type PlaybackState,
+	RSVPEngine,
+	tokenize,
+	type WordToken,
+} from "../services/rsvp-engine.js";
 import { recordSession } from "../services/stats-service.js";
 import {
 	getSavedDocument,
@@ -17,7 +23,11 @@ import {
 	saveDocument,
 	updateDocumentProgress,
 } from "../services/storage-service.js";
-import { applyBionicReading, loadPdfJs } from "../services/text-parser.js";
+import {
+	applyBionicReading,
+	extractPdfPageText,
+	loadPdfJs,
+} from "../services/text-parser.js";
 import { applyTheme } from "../services/theme-service.js";
 import { trackEvent, wpmBracket } from "../utils/analytics.js";
 import { emitProfileUpdated, navigate, showToast } from "../utils/events.js";
@@ -54,8 +64,18 @@ export class RsvpReader extends LitElement {
 	@state() private pdfBlob: Blob | null = null;
 	@state() private pdfPageNum = 1;
 	@state() private pdfPageCount = 0;
-	@state() private pdfPageRendering = false;
+	/** height/width of an unscaled page, used to reserve correct scroll space for pages that haven't rendered yet. */
+	@state() private pdfPageAspectRatio = 1.4;
 	private pdfDocProxy: PDFDocumentProxy | null = null;
+	/** One IntersectionObserver per mounted scroll container (desktop sidebar and/or mobile sheet). */
+	private _pdfObservers = new Map<Element, IntersectionObserver>();
+	/** Intersection ratio of every currently visible page, used to pick the "current" page for the pager. */
+	private _pdfVisibleRatios = new Map<number, number>();
+	@state() private showPageJumpModal = false;
+	@state() private pageJumpLoading = false;
+	@state() private pageJumpTokens: WordToken[] = [];
+	@state() private pageJumpWordTarget = 3;
+	@state() private pageJumpAnchorStart: number | null = null;
 	private wasPlayingBeforeSeek = false;
 	private countdownTimer: ReturnType<typeof setTimeout> | null = null;
 	private seekingPointerId: number | null = null;
@@ -281,6 +301,7 @@ export class RsvpReader extends LitElement {
 			this.handleVisibilityChange,
 		);
 		document.removeEventListener("paste", this.handleGlobalPaste);
+		this._disconnectPdfObservers();
 		this.pdfDocProxy?.destroy();
 		this.pdfDocProxy = null;
 	}
@@ -362,12 +383,15 @@ export class RsvpReader extends LitElement {
 	private static readonly RESUME_LOOKBACK_WORDS = 12;
 
 	private loadDoc(doc: ParsedDocument): void {
+		this._disconnectPdfObservers();
 		this.pdfDocProxy?.destroy();
 		this.pdfDocProxy = null;
 		this.pdfBlob = null;
 		this.pdfPageCount = 0;
 		this.pdfPageNum = 1;
+		this.pdfPageAspectRatio = 1.4;
 		this.showPdfViewer = false;
+		this._closePageJumpModal();
 		this.docTitle = doc.title;
 		this.totalDocWords = doc.wordCount;
 		this.rawDocText = doc.text;
@@ -546,14 +570,24 @@ export class RsvpReader extends LitElement {
 		}
 	};
 
+	/** How many pages beyond the visible range stay rendered, so small scroll jitters don't thrash the canvas cache. */
+	private static readonly PDF_KEEP_WINDOW = 6;
+
 	private _togglePdfViewer(): void {
 		if (this.showPdfViewer) {
-			this.showPdfViewer = false;
+			this._closePdfViewer();
 			return;
 		}
 		this.showSettings = false;
 		this.showPdfViewer = true;
 		void this._ensurePdfLoaded();
+	}
+
+	/** Closing unmounts the mobile sheet's scroll container, so its observer must be torn down too — recreated fresh on next open. */
+	private _closePdfViewer(): void {
+		this.showPdfViewer = false;
+		this._disconnectPdfObservers();
+		this._closePageJumpModal();
 	}
 
 	private async _ensurePdfLoaded(): Promise<void> {
@@ -563,41 +597,196 @@ export class RsvpReader extends LitElement {
 			this.pdfDocProxy = await getDocument({ data: arrayBuffer }).promise;
 			this.pdfPageCount = this.pdfDocProxy.numPages;
 			this.pdfPageNum = 1;
+			const firstPage = await this.pdfDocProxy.getPage(1);
+			const unscaled = firstPage.getViewport({ scale: 1 });
+			this.pdfPageAspectRatio = unscaled.height / unscaled.width;
 		}
 		await this.updateComplete;
-		requestAnimationFrame(() => void this._renderPdfPage(this.pdfPageNum));
+		this._setupPdfObservers();
 	}
 
-	private async _goToPdfPage(delta: number): Promise<void> {
-		const next = this.pdfPageNum + delta;
-		if (next < 1 || next > this.pdfPageCount) return;
-		this.pdfPageNum = next;
-		await this._renderPdfPage(next);
+	/** Attaches one IntersectionObserver per mounted scroll container (desktop sidebar / mobile sheet), skipping ones already wired up. */
+	private _setupPdfObservers(): void {
+		const containers = this.renderRoot.querySelectorAll<HTMLElement>(
+			".pdf-scroll-container",
+		);
+		for (const container of Array.from(containers)) {
+			if (this._pdfObservers.has(container)) continue;
+			const observer = new IntersectionObserver(
+				(entries) => this._onPdfPageIntersect(entries),
+				{ root: container, rootMargin: "150% 0px", threshold: [0, 0.5, 1] },
+			);
+			for (const slot of Array.from(
+				container.querySelectorAll<HTMLElement>(".pdf-page-slot"),
+			)) {
+				observer.observe(slot);
+			}
+			this._pdfObservers.set(container, observer);
+		}
 	}
 
-	/** Renders one page into every `.pdf-canvas` currently mounted (desktop sidebar and/or mobile sheet). */
-	private async _renderPdfPage(pageNum: number): Promise<void> {
+	private _disconnectPdfObservers(): void {
+		for (const observer of this._pdfObservers.values()) observer.disconnect();
+		this._pdfObservers.clear();
+		this._pdfVisibleRatios.clear();
+	}
+
+	private _onPdfPageIntersect(entries: IntersectionObserverEntry[]): void {
+		for (const entry of entries) {
+			const slot = entry.target as HTMLElement;
+			const pageNum = Number(slot.dataset.page);
+			if (!pageNum) continue;
+			if (entry.isIntersecting) {
+				this._pdfVisibleRatios.set(pageNum, entry.intersectionRatio);
+				void this._renderPdfPageInto(pageNum, slot);
+			} else {
+				this._pdfVisibleRatios.delete(pageNum);
+				if (Math.abs(pageNum - this.pdfPageNum) > RsvpReader.PDF_KEEP_WINDOW) {
+					this._evictPdfPage(slot);
+				}
+			}
+		}
+
+		let bestPage: number | null = null;
+		let bestRatio = 0;
+		for (const [page, ratio] of this._pdfVisibleRatios) {
+			if (ratio > bestRatio) {
+				bestRatio = ratio;
+				bestPage = page;
+			}
+		}
+		if (bestPage !== null) this.pdfPageNum = bestPage;
+	}
+
+	private async _renderPdfPageInto(
+		pageNum: number,
+		slot: HTMLElement,
+	): Promise<void> {
+		const canvas = slot.querySelector<HTMLCanvasElement>(".pdf-canvas");
 		const doc = this.pdfDocProxy;
-		if (!doc) return;
-		this.pdfPageRendering = true;
+		if (!canvas || !doc) return;
+		if (
+			canvas.dataset.rendered === "true" ||
+			canvas.dataset.rendering === "true"
+		)
+			return;
+		canvas.dataset.rendering = "true";
 		try {
 			const page = await doc.getPage(pageNum);
-			const canvases =
-				this.renderRoot.querySelectorAll<HTMLCanvasElement>(".pdf-canvas");
+			const containerWidth = slot.clientWidth || 320;
 			const unscaledViewport = page.getViewport({ scale: 1 });
-			for (const canvas of Array.from(canvases)) {
-				const containerWidth = canvas.parentElement?.clientWidth || 320;
-				const scale = Math.max(0.1, containerWidth / unscaledViewport.width);
-				const viewport = page.getViewport({ scale });
-				const ctx = canvas.getContext("2d");
-				if (!ctx) continue;
-				canvas.width = viewport.width;
-				canvas.height = viewport.height;
-				await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-			}
+			const scale = Math.max(0.1, containerWidth / unscaledViewport.width);
+			const viewport = page.getViewport({ scale });
+			const ctx = canvas.getContext("2d");
+			if (!ctx) return;
+			canvas.width = viewport.width;
+			canvas.height = viewport.height;
+			await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+			canvas.dataset.rendered = "true";
 		} finally {
-			this.pdfPageRendering = false;
+			canvas.dataset.rendering = "false";
 		}
+	}
+
+	/** Frees a far-off-screen page's canvas bitmap; it re-renders on demand if scrolled back into range. */
+	private _evictPdfPage(slot: HTMLElement): void {
+		const canvas = slot.querySelector<HTMLCanvasElement>(".pdf-canvas");
+		if (!canvas || canvas.dataset.rendered !== "true") return;
+		canvas.width = 0;
+		canvas.height = 0;
+		canvas.dataset.rendered = "false";
+	}
+
+	private _jumpToPdfPage(target: number): void {
+		const clamped = Math.max(1, Math.min(this.pdfPageCount, target));
+		const containers = this.renderRoot.querySelectorAll<HTMLElement>(
+			".pdf-scroll-container",
+		);
+		for (const container of Array.from(containers)) {
+			if (container.clientWidth === 0) continue;
+			const slot = container.querySelector<HTMLElement>(
+				`.pdf-page-slot[data-page="${clamped}"]`,
+			);
+			slot?.scrollIntoView({ behavior: "smooth", block: "start" });
+		}
+	}
+
+	private async _openPageJumpModal(): Promise<void> {
+		if (!this.pdfDocProxy) return;
+		this.showPageJumpModal = true;
+		this.pageJumpLoading = true;
+		this.pageJumpAnchorStart = null;
+		try {
+			const page = await this.pdfDocProxy.getPage(this.pdfPageNum);
+			const pageText = await extractPdfPageText(page);
+			this.pageJumpTokens = tokenize(pageText, this.settings);
+		} finally {
+			this.pageJumpLoading = false;
+		}
+	}
+
+	private _closePageJumpModal(): void {
+		this.showPageJumpModal = false;
+		this.pageJumpTokens = [];
+		this.pageJumpAnchorStart = null;
+	}
+
+	private _confirmPageJump(): void {
+		if (this.pageJumpAnchorStart === null) return;
+		const words = this.pageJumpTokens
+			.slice(
+				this.pageJumpAnchorStart,
+				this.pageJumpAnchorStart + this.pageJumpWordTarget,
+			)
+			.map((t) => t.text.trim())
+			.filter(Boolean);
+		if (words.length === 0) return;
+
+		const engineText = this.settings.removeCitations
+			? stripCitations(this.rawDocText)
+			: this.rawDocText;
+		const idx = this._findAnchorOffset(engineText, words);
+		if (idx === -1) {
+			showToast(
+				"Couldn't find that text in the document — try a different spot.",
+				"error",
+			);
+			return;
+		}
+
+		const wordIndex = tokenize(engineText.slice(0, idx), this.settings).length;
+		this.engine.seekToWord(wordIndex);
+		void this.persistProgress(this.engine.getState());
+		showToast(`Jumped to page ${this.pdfPageNum}`, "success");
+		this._closePageJumpModal();
+	}
+
+	/**
+	 * Matches the anchor words with flexible whitespace between them — the
+	 * popup's page text and `rawDocText` come from the same pdfjs extraction,
+	 * but words that wrap across a PDF line are joined by "\n" in the source
+	 * text, not the single space `words.join(" ")` would produce. Searches
+	 * near the page's estimated position first, so a short/common phrase
+	 * doesn't land on an earlier duplicate occurrence (repeated headers, etc.).
+	 */
+	private _findAnchorOffset(text: string, words: string[]): number {
+		const pattern = words
+			.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+			.join("\\s+");
+		const regex = new RegExp(pattern);
+
+		const approxOffset =
+			this.pdfPageCount > 0
+				? Math.floor(((this.pdfPageNum - 1) / this.pdfPageCount) * text.length)
+				: 0;
+		const windowSize = 30_000;
+		const start = Math.max(0, approxOffset - windowSize);
+		const end = Math.min(text.length, approxOffset + windowSize);
+		const nearbyMatch = text.slice(start, end).match(regex);
+		if (nearbyMatch?.index !== undefined) return start + nearbyMatch.index;
+
+		const globalMatch = text.match(regex);
+		return globalMatch?.index ?? -1;
 	}
 
 	private seekRatioFromPointerEvent(e: PointerEvent): number {
@@ -796,7 +985,7 @@ export class RsvpReader extends LitElement {
 							class="btn btn-ghost btn-md btn-circle min-h-[44px] min-w-[44px] touch-manipulation ${this.showSettings ? "bg-base-200" : ""}"
 							data-umami-event="settings-opened"
 							@click=${() => {
-								this.showPdfViewer = false;
+								this._closePdfViewer();
 								this.showSettings = !this.showSettings;
 							}}
 							title="Settings"
@@ -979,7 +1168,7 @@ export class RsvpReader extends LitElement {
 				<div
 					class="absolute inset-0 bg-base-content/40"
 					@click=${() => {
-						this.showPdfViewer = false;
+						this._closePdfViewer();
 					}}
 					aria-hidden="true"
 				></div>
@@ -1002,37 +1191,154 @@ export class RsvpReader extends LitElement {
 			<div class="px-5 py-4 border-b border-base-200 flex items-center justify-between shrink-0">
 				<span class="text-sm font-medium text-base-content/70 tracking-wide truncate">${this.docTitle || "Document"}</span>
 				<button class="btn btn-ghost btn-sm btn-circle" aria-label="Close PDF viewer" @click=${() => {
-					this.showPdfViewer = false;
+					this._closePdfViewer();
 				}}>
 					<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
 						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
 					</svg>
 				</button>
 			</div>
-			<div class="flex-1 overflow-auto flex items-start justify-center p-3 bg-base-200/40 relative">
+			<div class="pdf-scroll-container flex-1 overflow-auto bg-base-200/40 px-3 py-3">
 				${
-					this.pdfPageRendering
-						? html`<span class="loading loading-spinner loading-md absolute top-8"></span>`
-						: ""
+					this.pdfPageCount === 0
+						? html`<div class="w-full flex justify-center py-8"><span class="loading loading-spinner loading-md"></span></div>`
+						: repeat(
+								Array.from({ length: this.pdfPageCount }, (_, i) => i + 1),
+								(n) => n,
+								(n) => html`
+							<div
+								class="pdf-page-slot w-full mb-2"
+								data-page="${n}"
+								style="aspect-ratio: ${1 / this.pdfPageAspectRatio};"
+							>
+								<canvas class="pdf-canvas w-full h-full block shadow"></canvas>
+							</div>
+						`,
+							)
 				}
-				<canvas class="pdf-canvas max-w-full shadow"></canvas>
 			</div>
-			<div class="flex items-center justify-center gap-3 px-4 py-3 border-t border-base-200 shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+			<div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-base-200 shrink-0 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
 				<button
 					type="button"
 					class="btn btn-ghost btn-sm btn-circle"
 					?disabled=${this.pdfPageNum <= 1}
-					@click=${() => this._goToPdfPage(-1)}
+					@click=${() => this._jumpToPdfPage(this.pdfPageNum - 1)}
 					aria-label="Previous page"
 				>‹</button>
-				<span class="text-xs font-mono text-base-content/60">Page ${this.pdfPageNum} of ${this.pdfPageCount}</span>
+				<input
+					type="number"
+					class="input input-xs input-bordered w-14 text-center font-mono"
+					min="1"
+					max="${this.pdfPageCount}"
+					.value=${String(this.pdfPageNum)}
+					@keydown=${(e: KeyboardEvent) => {
+						if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+					}}
+					@change=${(e: Event) => {
+						this._jumpToPdfPage(Number((e.target as HTMLInputElement).value));
+					}}
+					aria-label="Page number"
+				/>
+				<span class="text-xs font-mono text-base-content/60">of ${this.pdfPageCount}</span>
 				<button
 					type="button"
 					class="btn btn-ghost btn-sm btn-circle"
 					?disabled=${this.pdfPageNum >= this.pdfPageCount}
-					@click=${() => this._goToPdfPage(1)}
+					@click=${() => this._jumpToPdfPage(this.pdfPageNum + 1)}
 					aria-label="Next page"
 				>›</button>
+				<button
+					type="button"
+					class="btn btn-ghost btn-sm btn-circle"
+					?disabled=${this.pdfPageCount === 0}
+					@click=${() => void this._openPageJumpModal()}
+					title="Jump reader to this page"
+					aria-label="Jump reader to this page"
+				>
+					<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+					</svg>
+				</button>
+			</div>
+			${this.showPageJumpModal ? this.renderPageJumpModal() : ""}
+		`;
+	}
+
+	private renderPageJumpModal() {
+		const anchorStart = this.pageJumpAnchorStart;
+		const anchorEnd =
+			anchorStart !== null ? anchorStart + this.pageJumpWordTarget : null;
+		return html`
+			<div
+				class="fixed inset-0 bg-base-content/50 z-50 flex items-center justify-center p-4"
+				@click=${() => this._closePageJumpModal()}
+				aria-hidden="true"
+			>
+				<div
+					class="card bg-base-100 w-full max-w-lg shadow-xl max-h-[85vh] flex flex-col"
+					@click=${(e: Event) => e.stopPropagation()}
+					role="dialog"
+					aria-label="Jump reader to this page"
+				>
+					<div class="card-body overflow-hidden flex flex-col">
+						<div class="flex items-center justify-between mb-1">
+							<h3 class="font-medium text-base-content">Jump reader to page ${this.pdfPageNum}</h3>
+							<button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" @click=${() => this._closePageJumpModal()}>
+								<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+								</svg>
+							</button>
+						</div>
+						<p class="text-xs text-base-content/50 mb-2">
+							Click the first word of a passage below — the reader will jump to where that text appears.
+						</p>
+						<div class="flex items-center gap-2 mb-3">
+							<label class="text-xs text-base-content/60 shrink-0" for="page-jump-word-count">Match length</label>
+							<input
+								id="page-jump-word-count"
+								type="range"
+								min="1"
+								max="8"
+								class="range range-xs"
+								.value=${String(this.pageJumpWordTarget)}
+								@input=${(e: Event) => {
+									this.pageJumpWordTarget = Number(
+										(e.target as HTMLInputElement).value,
+									);
+								}}
+							/>
+							<span class="text-xs font-mono text-base-content/60 w-16 shrink-0">${this.pageJumpWordTarget} word${this.pageJumpWordTarget === 1 ? "" : "s"}</span>
+						</div>
+						<div class="flex-1 overflow-y-auto border border-base-200 rounded-lg p-3 text-sm leading-relaxed" dir="auto">
+							${
+								this.pageJumpLoading
+									? html`<div class="flex justify-center py-8"><span class="loading loading-spinner loading-md"></span></div>`
+									: this.pageJumpTokens.map(
+											(t, i) => html`<span
+												class="cursor-pointer rounded transition-colors duration-100 hover:bg-primary/20 ${
+													anchorStart !== null &&
+													i >= anchorStart &&
+													i < (anchorEnd ?? 0)
+														? "bg-primary/30 text-primary font-medium"
+														: ""
+												}"
+												@click=${() => {
+													this.pageJumpAnchorStart = i;
+												}}
+											>${t.text} </span>`,
+										)
+							}
+						</div>
+						<div class="flex justify-end gap-2 mt-3">
+							<button class="btn btn-ghost btn-sm" @click=${() => this._closePageJumpModal()}>Cancel</button>
+							<button
+								class="btn btn-primary btn-sm"
+								?disabled=${anchorStart === null}
+								@click=${() => this._confirmPageJump()}
+							>Jump</button>
+						</div>
+					</div>
+				</div>
 			</div>
 		`;
 	}
