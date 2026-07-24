@@ -61,6 +61,8 @@ export class RsvpReader extends LitElement {
 	private _handleResize = (): void => {
 		if (this.settings?.tickerMode && this.playbackState) {
 			requestAnimationFrame(() => this._positionTicker());
+		} else if (this.playbackState) {
+			requestAnimationFrame(() => this._positionMarquee());
 		}
 	};
 
@@ -280,6 +282,9 @@ export class RsvpReader extends LitElement {
 		// Ticker: position the strip via DOM measurement after every render.
 		if (this.settings?.tickerMode && this.playbackState) {
 			requestAnimationFrame(() => this._positionTicker());
+		} else if (this.playbackState) {
+			// Ambient marquee: glide the strip to the new current word after every render.
+			requestAnimationFrame(() => this._positionMarquee());
 		}
 
 		this.alignRtlPivot();
@@ -745,6 +750,7 @@ export class RsvpReader extends LitElement {
 
 					<!-- Word Display Area -->
 					<div
+						id="word-display-area"
 						class="flex-1 flex flex-col items-center justify-center cursor-pointer select-none overflow-hidden relative"
 						@click=${this.togglePlay}
 					>
@@ -760,6 +766,13 @@ export class RsvpReader extends LitElement {
 										: this.renderWordDisplay(s)
 						}
 					</div>
+
+					<!-- Ambient Word Marquee -->
+					${
+						!focusModeActive && s && hasDoc && !this.settings.tickerMode
+							? this.renderMarquee(s)
+							: ""
+					}
 
 					<!-- Bottom Controls -->
 					${
@@ -1162,6 +1175,115 @@ export class RsvpReader extends LitElement {
 
 		// We use "stepped" mode (instant snap, no linear transition) instead of
 		// smooth scrolling to prevent 'smooth pursuit' eye strain.
+		strip.style.transition = "none";
+		strip.style.transform = `translateX(${target}px)`;
+	}
+
+	/**
+	 * Ambient marquee — a thin strip between the Word Display Area and the
+	 * bottom controls that shows a window of surrounding words, centered
+	 * on the current word. Unlike the ticker (the primary focal display,
+	 * which snaps instantly to avoid smooth-pursuit eye strain), this is
+	 * a secondary/decorative element, so it glides with a linear CSS
+	 * transition timed to the current words-per-minute rate.
+	 */
+	private renderMarquee(s: PlaybackState) {
+		const tokens = this.engine.tokens;
+		if (!tokens.length) return "";
+
+		const idx = s.displayWordIndex;
+		const windowBehind = 20;
+		const windowAhead = 40;
+		const windowStart = Math.max(0, idx - windowBehind);
+		const windowEnd = Math.min(tokens.length, idx + windowAhead);
+		const windowTokens = tokens.slice(windowStart, windowEnd);
+
+		const highlightColor = this.settings.highlightColor;
+
+		const spans = windowTokens.map((token, wi) => {
+			const globalIdx = windowStart + wi;
+			const isCurrent = globalIdx === idx;
+			const isPast = globalIdx < idx;
+
+			if (isCurrent) {
+				return html`<span
+					data-marquee-current
+					style="color:${highlightColor};font-weight:600;"
+				>${token.text} </span>`;
+			}
+			const opacity = isPast ? "0.2" : "0.45";
+			return html`<span style="color:#fff;opacity:${opacity};">${token.text} </span>`;
+		});
+
+		return html`
+			<div
+				id="marquee-container"
+				class="w-full h-10 md:h-12 shrink-0 flex items-center overflow-hidden relative border-t border-base-200"
+				aria-hidden="true"
+			>
+				<!-- Right fade mask -->
+				<div class="absolute inset-y-0 right-0 w-10 md:w-20 z-10 pointer-events-none"
+					style="background: linear-gradient(to right, transparent, oklch(var(--b1)))"
+				></div>
+				<!-- Left fade mask -->
+				<div class="absolute inset-y-0 left-0 w-10 md:w-20 z-10 pointer-events-none"
+					style="background: linear-gradient(to left, transparent, oklch(var(--b1)))"
+				></div>
+				<!-- Gliding text strip (transform/transition set imperatively) -->
+				<div
+					id="marquee-strip"
+					class="relative whitespace-nowrap select-none will-change-transform text-sm md:text-base font-mono"
+				>
+					${spans}
+				</div>
+			</div>
+		`;
+	}
+
+	/**
+	 * Imperatively positions the marquee strip so the *center* of the
+	 * highlighted (current) word always aligns, on the x axis, with the
+	 * real on-screen ORP pivot in the main Word Display Area — not just
+	 * a fraction of the marquee's own width. This keeps the anchor point
+	 * constant even as `pivotOffset` shifts the pivot left/right, and
+	 * keeps the highlighted word visually steady regardless of its own
+	 * pixel width. Positioning is instant (no transition) — same "stepped"
+	 * approach as the ticker — so the strip snaps cleanly to each new word.
+	 */
+	private _getPivotAnchorX(containerRect: DOMRect): number | null {
+		const pivotEl =
+			this.renderRoot.querySelector<HTMLElement>(".orp-pivot-col") ??
+			this.renderRoot.querySelector<HTMLElement>("#rtl-pivot");
+		if (pivotEl) {
+			const pivotRect = pivotEl.getBoundingClientRect();
+			return pivotRect.left + pivotRect.width / 2 - containerRect.left;
+		}
+		// Fallback (plain text, no ORP): anchor to the center of the word display area.
+		const wordArea =
+			this.renderRoot.querySelector<HTMLElement>("#word-display-area");
+		if (!wordArea) return null;
+		const areaRect = wordArea.getBoundingClientRect();
+		return areaRect.left + areaRect.width / 2 - containerRect.left;
+	}
+
+	private _positionMarquee(): void {
+		const container =
+			this.renderRoot.querySelector<HTMLElement>("#marquee-container");
+		const strip = this.renderRoot.querySelector<HTMLElement>("#marquee-strip");
+		const current = strip?.querySelector<HTMLElement>("[data-marquee-current]");
+		if (!container || !strip || !current) return;
+
+		const s = this.playbackState;
+		if (!s) return;
+
+		const containerRect = container.getBoundingClientRect();
+		const anchorX =
+			this._getPivotAnchorX(containerRect) ?? container.clientWidth * 0.5;
+
+		// Center the highlighted word (not just its left edge) under the anchor.
+		const wordCenter = current.offsetLeft + current.offsetWidth / 2;
+		const target = anchorX - wordCenter;
+
 		strip.style.transition = "none";
 		strip.style.transform = `translateX(${target}px)`;
 	}
