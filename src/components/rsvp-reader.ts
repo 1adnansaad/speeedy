@@ -68,6 +68,14 @@ export class RsvpReader extends LitElement {
 	@state() private pdfPageCount = 0;
 	/** height/width of an unscaled page, used to reserve correct scroll space for pages that haven't rendered yet. */
 	@state() private pdfPageAspectRatio = 1.4;
+	/** Current width of the desktop PDF sidebar, in px. Drag-adjustable and persisted. */
+	@state() private pdfPanelWidth = RsvpReader.PDF_PANEL_DEFAULT_WIDTH;
+	/** True while the resize handle is being dragged — suppresses the width transition so the panel tracks the cursor 1:1. */
+	@state() private isResizingPdfPanel = false;
+	private pdfResizePointerId: number | null = null;
+	private pdfResizeStartX = 0;
+	private pdfResizeStartWidth = 0;
+	private _pdfReRenderFrame: number | null = null;
 	private pdfDocProxy: PDFDocumentProxy | null = null;
 	/** One wide-margin IntersectionObserver per mounted scroll container, used only to prefetch/evict page canvases. */
 	private _pdfObservers = new Map<Element, IntersectionObserver>();
@@ -115,6 +123,13 @@ export class RsvpReader extends LitElement {
 	// ── Ticker mode bookkeeping ──────────────────────────────────────────────
 
 	private _handleResize = (): void => {
+		// The panel's max width depends on the window, so a shrinking window
+		// has to pull an over-wide panel back in.
+		const clamped = this._clampPdfPanelWidth(this.pdfPanelWidth);
+		if (clamped !== this.pdfPanelWidth) {
+			this.pdfPanelWidth = clamped;
+			if (this.showPdfViewer) this._scheduleVisiblePdfReRender();
+		}
 		if (this.settings?.tickerMode && this.playbackState) {
 			requestAnimationFrame(() => this._positionTicker());
 		} else if (this.playbackState) {
@@ -223,6 +238,7 @@ export class RsvpReader extends LitElement {
 
 	override connectedCallback(): void {
 		super.connectedCallback();
+		this._loadPdfPanelWidth();
 		this.settings = {
 			...DEFAULT_SETTINGS,
 			...this.profile.settings,
@@ -330,6 +346,10 @@ export class RsvpReader extends LitElement {
 		);
 		document.removeEventListener("paste", this.handleGlobalPaste);
 		this._disconnectPdfObservers();
+		if (this._pdfReRenderFrame !== null) {
+			cancelAnimationFrame(this._pdfReRenderFrame);
+			this._pdfReRenderFrame = null;
+		}
 		this.pdfDocProxy?.destroy();
 		this.pdfDocProxy = null;
 		this._pdfOutline = [];
@@ -608,6 +628,140 @@ export class RsvpReader extends LitElement {
 	/** How many pages beyond the visible range stay rendered, so small scroll jitters don't thrash the canvas cache. */
 	private static readonly PDF_KEEP_WINDOW = 6;
 
+	// ── PDF sidebar resizing ─────────────────────────────────────────────────
+
+	private static readonly PDF_PANEL_DEFAULT_WIDTH = 320;
+	private static readonly PDF_PANEL_MIN_WIDTH = 260;
+	private static readonly PDF_PANEL_MAX_WIDTH = 900;
+	private static readonly PDF_PANEL_WIDTH_KEY = "speeedy:pdf-panel-width";
+	/** Keep at least this much room for the reader column so the panel can never swallow the window. */
+	private static readonly PDF_PANEL_MIN_READER_WIDTH = 420;
+	/** Arrow-key step for the keyboard-accessible resize handle. */
+	private static readonly PDF_PANEL_KEY_STEP = 24;
+
+	/**
+	 * Upper bound is the smaller of the fixed max and whatever leaves the
+	 * reader its minimum width, so the panel stays usable on narrow laptops
+	 * and can't push the word display off-screen. The viewport term is skipped
+	 * when the window hasn't been laid out yet (innerWidth 0 during
+	 * connectedCallback) — otherwise it would collapse to the minimum and
+	 * silently shrink a restored preference.
+	 */
+	private _clampPdfPanelWidth(width: number): number {
+		const viewport = window.innerWidth;
+		const max = viewport
+			? Math.max(
+					RsvpReader.PDF_PANEL_MIN_WIDTH,
+					Math.min(
+						RsvpReader.PDF_PANEL_MAX_WIDTH,
+						viewport - RsvpReader.PDF_PANEL_MIN_READER_WIDTH,
+					),
+				)
+			: RsvpReader.PDF_PANEL_MAX_WIDTH;
+		return Math.round(
+			Math.max(RsvpReader.PDF_PANEL_MIN_WIDTH, Math.min(max, width)),
+		);
+	}
+
+	private _loadPdfPanelWidth(): void {
+		const stored = Number(localStorage.getItem(RsvpReader.PDF_PANEL_WIDTH_KEY));
+		if (Number.isFinite(stored) && stored > 0) {
+			this.pdfPanelWidth = this._clampPdfPanelWidth(stored);
+		}
+	}
+
+	private _onPdfResizeStart = (e: PointerEvent): void => {
+		e.preventDefault();
+		this.isResizingPdfPanel = true;
+		this.pdfResizePointerId = e.pointerId;
+		this.pdfResizeStartX = e.clientX;
+		this.pdfResizeStartWidth = this.pdfPanelWidth;
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+	};
+
+	/** The panel is docked right, so dragging the handle leftwards (negative delta) widens it. */
+	private _onPdfResizeMove = (e: PointerEvent): void => {
+		if (!this.isResizingPdfPanel || e.pointerId !== this.pdfResizePointerId)
+			return;
+		e.preventDefault();
+		this.pdfPanelWidth = this._clampPdfPanelWidth(
+			this.pdfResizeStartWidth + (this.pdfResizeStartX - e.clientX),
+		);
+	};
+
+	private _onPdfResizeEnd = (e: PointerEvent): void => {
+		if (e.pointerId !== this.pdfResizePointerId) return;
+		this.isResizingPdfPanel = false;
+		this.pdfResizePointerId = null;
+		const target = e.currentTarget as HTMLElement;
+		if (target.hasPointerCapture(e.pointerId))
+			target.releasePointerCapture(e.pointerId);
+		this._commitPdfPanelWidth();
+	};
+
+	private _onPdfResizeKeydown = (e: KeyboardEvent): void => {
+		const step = RsvpReader.PDF_PANEL_KEY_STEP;
+		if (e.key === "ArrowLeft") {
+			e.preventDefault();
+			this.pdfPanelWidth = this._clampPdfPanelWidth(this.pdfPanelWidth + step);
+		} else if (e.key === "ArrowRight") {
+			e.preventDefault();
+			this.pdfPanelWidth = this._clampPdfPanelWidth(this.pdfPanelWidth - step);
+		} else {
+			return;
+		}
+		this._commitPdfPanelWidth();
+	};
+
+	private _commitPdfPanelWidth(): void {
+		localStorage.setItem(
+			RsvpReader.PDF_PANEL_WIDTH_KEY,
+			String(this.pdfPanelWidth),
+		);
+		this._scheduleVisiblePdfReRender();
+	}
+
+	/**
+	 * Canvases scale with CSS during the drag, which keeps the resize smooth
+	 * but leaves the bitmap at its old resolution — blurry once enlarged.
+	 * Re-render the pages worth looking at so they come back crisp at the new
+	 * width. Coalesced into one frame so a burst of key presses renders once.
+	 */
+	private _scheduleVisiblePdfReRender(): void {
+		if (this._pdfReRenderFrame !== null)
+			cancelAnimationFrame(this._pdfReRenderFrame);
+		this._pdfReRenderFrame = requestAnimationFrame(() => {
+			this._pdfReRenderFrame = null;
+			void this._reRenderVisiblePdfPages();
+		});
+	}
+
+	private async _reRenderVisiblePdfPages(): Promise<void> {
+		await this.updateComplete;
+		const containers = Array.from(
+			this.renderRoot.querySelectorAll<HTMLElement>(".pdf-scroll-container"),
+		).filter((container) => container.clientWidth > 0);
+		for (const container of containers) {
+			const slots = Array.from(
+				container.querySelectorAll<HTMLElement>(".pdf-page-slot"),
+			);
+			for (const slot of slots) {
+				const pageNum = Number(slot.dataset.page);
+				if (
+					!pageNum ||
+					Math.abs(pageNum - this.pdfPageNum) > RsvpReader.PDF_KEEP_WINDOW
+				)
+					continue;
+				const canvas = slot.querySelector<HTMLCanvasElement>(".pdf-canvas");
+				if (!canvas || canvas.dataset.rendered !== "true") continue;
+				// Clearing the flag is what lets _renderPdfPageInto run again; it
+				// re-reads slot.clientWidth, so the new scale comes for free.
+				canvas.dataset.rendered = "false";
+				void this._renderPdfPageInto(pageNum, slot);
+			}
+		}
+	}
+
 	private _togglePdfViewer(): void {
 		if (this.showPdfViewer) {
 			this._closePdfViewer();
@@ -615,6 +769,9 @@ export class RsvpReader extends LitElement {
 		}
 		this.showSettings = false;
 		this.showPdfViewer = true;
+		// Layout is known by now, unlike at connectedCallback — re-clamp so a
+		// preference saved on a wider window doesn't crowd out the reader here.
+		this.pdfPanelWidth = this._clampPdfPanelWidth(this.pdfPanelWidth);
 		void this._ensurePdfLoaded();
 	}
 
@@ -624,6 +781,7 @@ export class RsvpReader extends LitElement {
 		this._disconnectPdfObservers();
 		this._closePageJumpModal();
 		this._closePdfSearch();
+		this._closeChaptersPanel();
 	}
 
 	private async _ensurePdfLoaded(): Promise<void> {
@@ -883,8 +1041,12 @@ export class RsvpReader extends LitElement {
 	}
 
 	private _togglePdfSearch(): void {
-		this.showPdfSearch = !this.showPdfSearch;
-		if (!this.showPdfSearch) return;
+		if (this.showPdfSearch) {
+			this._closePdfSearch();
+			return;
+		}
+		this._closeChaptersPanel();
+		this.showPdfSearch = true;
 		requestAnimationFrame(() => {
 			this.renderRoot
 				.querySelector<HTMLInputElement>(".pdf-search-input")
@@ -982,8 +1144,14 @@ export class RsvpReader extends LitElement {
 		this._closePageJumpModal();
 	}
 
-	private _openChaptersPanel(): void {
+	/** Both drawers occupy the same strip above the toolbar, so opening one closes the other. */
+	private _toggleChaptersPanel(): void {
+		if (this.showChaptersPanel) {
+			this._closeChaptersPanel();
+			return;
+		}
 		if (!this.pdfHasOutline) return;
+		this._closePdfSearch();
 		this.showChaptersPanel = true;
 	}
 
@@ -1348,8 +1516,32 @@ export class RsvpReader extends LitElement {
 				focusModeActive
 					? nothing
 					: html`
-			<div class="hidden md:flex transition-all duration-300 ${this.showPdfViewer ? "w-80 border-l border-base-200" : "w-0"} overflow-hidden shrink-0 bg-base-100 flex-col relative z-40">
-				<div class="w-80 flex flex-col h-full overflow-hidden">
+			<div
+				class="hidden md:flex ${this.isResizingPdfPanel ? "" : "transition-all duration-300"} ${this.showPdfViewer ? "border-l border-base-200" : ""} overflow-hidden shrink-0 bg-base-100 flex-col relative z-40"
+				style="width: ${this.showPdfViewer ? this.pdfPanelWidth : 0}px"
+			>
+				${
+					this.showPdfViewer
+						? html`
+					<div
+						class="absolute left-0 top-0 h-full w-1.5 cursor-col-resize z-50 hover:bg-primary/40 ${
+							this.isResizingPdfPanel ? "bg-primary/60" : ""
+						} transition-colors"
+						role="separator"
+						tabindex="0"
+						aria-label="Resize PDF panel"
+						aria-orientation="vertical"
+						aria-valuenow=${this.pdfPanelWidth}
+						@pointerdown=${this._onPdfResizeStart}
+						@pointermove=${this._onPdfResizeMove}
+						@pointerup=${this._onPdfResizeEnd}
+						@pointercancel=${this._onPdfResizeEnd}
+						@keydown=${this._onPdfResizeKeydown}
+					></div>
+				`
+						: nothing
+				}
+				<div class="flex flex-col h-full overflow-hidden" style="width: ${this.pdfPanelWidth}px">
 					${this.renderPdfPanel()}
 				</div>
 			</div>
@@ -1454,6 +1646,7 @@ export class RsvpReader extends LitElement {
 				}
 			</div>
 			<div class="relative shrink-0">
+				${this.renderChaptersDrawer()}
 				<div
 					class="pdf-search-drawer absolute bottom-full left-0 right-0 bg-base-100 border-t border-base-200 shadow-lg p-2 flex items-center gap-1.5 z-10 transition-all duration-150 ${
 						this.showPdfSearch
@@ -1518,6 +1711,32 @@ export class RsvpReader extends LitElement {
 				<div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-base-200 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
 					<button
 						type="button"
+						class="btn btn-ghost btn-sm btn-circle ${this.showChaptersPanel ? "bg-base-200" : ""}"
+						?disabled=${!this.pdfHasOutline}
+						@click=${() => this._toggleChaptersPanel()}
+						title=${this.pdfHasOutline ? "Chapters" : "No chapters found in this PDF"}
+						aria-label="Chapters"
+						aria-expanded="${this.showChaptersPanel}"
+					>
+						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 6h16M4 12h9M4 18h9"/>
+						</svg>
+					</button>
+					<button
+						type="button"
+						class="btn btn-ghost btn-sm btn-circle ${this.showPdfSearch ? "bg-base-200" : ""}"
+						?disabled=${this.pdfPageCount === 0}
+						@click=${() => this._togglePdfSearch()}
+						title="Find in PDF"
+						aria-label="${this.showPdfSearch ? "Close find in PDF" : "Find in PDF"}"
+						aria-expanded="${this.showPdfSearch}"
+					>
+						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
+						</svg>
+					</button>
+					<button
+						type="button"
 						class="btn btn-ghost btn-sm btn-circle"
 						?disabled=${this.pdfPageNum <= 1}
 						@click=${() => this._jumpToPdfPage(this.pdfPageNum - 1)}
@@ -1557,35 +1776,9 @@ export class RsvpReader extends LitElement {
 							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
 						</svg>
 					</button>
-					<button
-						type="button"
-						class="btn btn-ghost btn-sm btn-circle ${this.showPdfSearch ? "bg-base-200" : ""}"
-						?disabled=${this.pdfPageCount === 0}
-						@click=${() => this._togglePdfSearch()}
-						title="Find in PDF"
-						aria-label="${this.showPdfSearch ? "Close find in PDF" : "Find in PDF"}"
-						aria-expanded="${this.showPdfSearch}"
-					>
-						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
-						</svg>
-					</button>
-					<button
-						type="button"
-						class="btn btn-ghost btn-sm btn-circle"
-						?disabled=${!this.pdfHasOutline}
-						@click=${() => this._openChaptersPanel()}
-						title=${this.pdfHasOutline ? "Chapters" : "No chapters found in this PDF"}
-						aria-label="Chapters"
-					>
-						<svg class="w-4 h-4 opacity-70" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 6h16M4 12h9M4 18h9"/>
-						</svg>
-					</button>
 				</div>
 			</div>
 			${this.showPageJumpModal ? this.renderPageJumpModal() : ""}
-			${this.showChaptersPanel ? this.renderChaptersModal() : ""}
 		`;
 	}
 
@@ -1676,36 +1869,38 @@ export class RsvpReader extends LitElement {
 		`;
 	}
 
-	private renderChaptersModal() {
+	/** Slides up from the toolbar like the find drawer, so both live in the panel instead of taking over the screen. */
+	private renderChaptersDrawer() {
 		return html`
 			<div
-				class="fixed inset-0 bg-base-content/50 z-50 flex items-center justify-center p-4"
-				@click=${() => this._closeChaptersPanel()}
-				aria-hidden="true"
+				class="pdf-chapters-drawer absolute bottom-full left-0 right-0 bg-base-100 border-t border-base-200 shadow-lg z-10 flex flex-col max-h-[60vh] transition-all duration-150 ${
+					this.showChaptersPanel
+						? "translate-y-0 opacity-100"
+						: "translate-y-2 opacity-0 pointer-events-none"
+				}"
+				role="dialog"
+				aria-label="Chapters"
+				aria-hidden=${!this.showChaptersPanel}
 			>
-				<div
-					class="card bg-base-100 w-full max-w-lg shadow-xl max-h-[85vh] flex flex-col"
-					@click=${(e: Event) => e.stopPropagation()}
-					role="dialog"
-					aria-label="Chapters"
-				>
-					<div class="card-body overflow-hidden flex flex-col">
-						<div class="flex items-center justify-between mb-1">
-							<h3 class="font-medium text-base-content">Chapters</h3>
-							<button class="btn btn-ghost btn-xs btn-circle" aria-label="Close" @click=${() => this._closeChaptersPanel()}>
-								<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-								</svg>
-							</button>
-						</div>
-						<div class="flex-1 overflow-y-auto border border-base-200 rounded-lg p-2 text-sm">
-							${
-								this._pdfOutline.length === 0
-									? html`<p class="text-xs text-base-content/50 p-2">No chapters found in this PDF.</p>`
-									: this._renderOutlineEntries(this._pdfOutline, 0)
-							}
-						</div>
-					</div>
+				<div class="flex items-center justify-between px-3 py-2 border-b border-base-200 shrink-0">
+					<span class="text-xs font-medium text-base-content/70 tracking-wide">Chapters</span>
+					<button
+						type="button"
+						class="btn btn-ghost btn-xs btn-circle"
+						aria-label="Close chapters"
+						@click=${() => this._closeChaptersPanel()}
+					>
+						<svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+						</svg>
+					</button>
+				</div>
+				<div class="flex-1 overflow-y-auto p-2 text-sm">
+					${
+						this._pdfOutline.length === 0
+							? html`<p class="text-xs text-base-content/50 p-2">No chapters found in this PDF.</p>`
+							: this._renderOutlineEntries(this._pdfOutline, 0)
+					}
 				</div>
 			</div>
 		`;
