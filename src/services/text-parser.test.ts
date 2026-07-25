@@ -3,9 +3,13 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	applyBionicReading,
+	buildPdfPageSearchIndexFromItems,
 	createDocFromText,
+	findMatchRanges,
 	type PdfOutlineNode,
+	type PdfTextItemLike,
 	parseFile,
+	rangesToRects,
 	resolvePdfOutline,
 } from "./text-parser.js";
 
@@ -249,5 +253,180 @@ describe("resolvePdfOutline", () => {
 			{ title: "Broken", page: null, children: [] },
 			{ title: "Fine", page: null, children: [] },
 		]);
+	});
+});
+
+describe("PDF in-page search", () => {
+	// pdf.js text-item shape: transform is [fontSize, 0, 0, fontSize, x, y]
+	// with y a baseline in PDF space (origin bottom-left).
+	function item(
+		str: string,
+		x: number,
+		y: number,
+		width: number,
+		fontSize = 12,
+	): PdfTextItemLike {
+		return {
+			str,
+			width,
+			height: fontSize,
+			transform: [fontSize, 0, 0, fontSize, x, y],
+		};
+	}
+
+	// A scale-1, unrotated viewport for a 600x800 page, as pdf.js builds it.
+	const viewport = {
+		transform: [1, 0, 0, -1, 0, 800],
+		width: 600,
+		height: 800,
+		scale: 1,
+	};
+
+	describe("findMatchRanges", () => {
+		it("finds every occurrence of a substring by default", () => {
+			const ranges = findMatchRanges("start art heart", "art", false);
+			expect(ranges).toEqual([
+				[2, 5],
+				[6, 9],
+				[12, 15],
+			]);
+		});
+
+		it("keeps only standalone words when wholeWord is set", () => {
+			const ranges = findMatchRanges("start art heart", "art", true);
+			expect(ranges).toEqual([[6, 9]]);
+		});
+
+		it("treats punctuation as a word boundary", () => {
+			expect(findMatchRanges("(art), art.", "art", true)).toEqual([
+				[1, 4],
+				[7, 10],
+			]);
+		});
+
+		it("does not treat digits or underscores as boundaries", () => {
+			expect(findMatchRanges("art1 _art", "art", true)).toEqual([]);
+		});
+
+		it("returns nothing for an empty or whitespace query", () => {
+			expect(findMatchRanges("some text", "   ", false)).toEqual([]);
+		});
+
+		it("matches case-insensitively", () => {
+			expect(findMatchRanges("the habit", "HABIT", false)).toEqual([[4, 9]]);
+		});
+	});
+
+	describe("buildPdfPageSearchIndexFromItems", () => {
+		it("case-folds text and maps each character back to its item", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("Habit", 100, 700, 30),
+			]);
+			expect(index.text).toBe("habit");
+			expect(index.charMap[0]).toEqual({ itemIndex: 0, offset: 0 });
+			expect(index.charMap[4]).toEqual({ itemIndex: 0, offset: 4 });
+		});
+
+		it("joins a line wrap with a space so a phrase matches across it", () => {
+			// Second item sits a line lower, which the line builder would treat
+			// as a newline — here it becomes a space instead.
+			const index = buildPdfPageSearchIndexFromItems([
+				item("highly", 100, 700, 36),
+				item("effective", 100, 680, 54),
+			]);
+			expect(index.text).toBe("highly effective");
+			expect(findMatchRanges(index.text, "highly effective", false)).toEqual([
+				[0, 16],
+			]);
+			// The synthesized space maps to no glyph.
+			expect(index.charMap[6]).toBeNull();
+		});
+
+		it("inserts a space for a wide horizontal gap on the same line", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("one", 100, 700, 18),
+				item("two", 400, 700, 18),
+			]);
+			expect(index.text).toBe("one two");
+		});
+
+		it("skips empty items without disturbing the mapping", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("ab", 100, 700, 12),
+				{ str: "", width: 0, transform: [12, 0, 0, 12, 130, 700] },
+			]);
+			expect(index.text).toBe("ab");
+			expect(index.charMap).toHaveLength(2);
+		});
+	});
+
+	describe("rangesToRects", () => {
+		it("positions a whole-item match as page fractions", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("habit", 100, 700, 60),
+			]);
+			const rects = rangesToRects(index, [[0, 5]], viewport);
+
+			expect(rects).toHaveLength(1);
+			// x=100 of 600 wide; baseline 700 flips to y=100, glyph top 100-12=88.
+			expect(rects[0].left).toBeCloseTo(100 / 600, 5);
+			expect(rects[0].top).toBeCloseTo(88 / 800, 5);
+			expect(rects[0].width).toBeCloseTo(60 / 600, 5);
+			expect(rects[0].height).toBeCloseTo(12 / 800, 5);
+		});
+
+		it("covers only the matched slice of a longer item", () => {
+			// "art" inside "start": chars 2..5 of 5, so 40% in, 60% wide.
+			const index = buildPdfPageSearchIndexFromItems([
+				item("start", 100, 700, 50),
+			]);
+			const rects = rangesToRects(
+				index,
+				findMatchRanges(index.text, "art", false),
+				viewport,
+			);
+
+			expect(rects).toHaveLength(1);
+			expect(rects[0].left).toBeCloseTo((100 + 0.4 * 50) / 600, 5);
+			expect(rects[0].width).toBeCloseTo((0.6 * 50) / 600, 5);
+		});
+
+		it("emits one rect per line for a match spanning a wrap", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("highly", 100, 700, 36),
+				item("effective", 100, 680, 54),
+			]);
+			const rects = rangesToRects(
+				index,
+				findMatchRanges(index.text, "highly effective", false),
+				viewport,
+			);
+
+			expect(rects).toHaveLength(2);
+			expect(rects[0].top).toBeCloseTo(88 / 800, 5);
+			expect(rects[1].top).toBeCloseTo(108 / 800, 5);
+		});
+
+		it("keeps every rect within the page", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				item("edge", 580, 10, 400),
+				item("over", -50, 900, 200),
+			]);
+			const rects = rangesToRects(index, [[0, index.text.length]], viewport);
+
+			for (const rect of rects) {
+				for (const value of [rect.left, rect.top, rect.width, rect.height]) {
+					expect(value).toBeGreaterThanOrEqual(0);
+					expect(value).toBeLessThanOrEqual(1);
+				}
+			}
+		});
+
+		it("drops items with no transform rather than throwing", () => {
+			const index = buildPdfPageSearchIndexFromItems([
+				{ str: "habit", width: 30 },
+			]);
+			expect(rangesToRects(index, [[0, 5]], viewport)).toEqual([]);
+		});
 	});
 });

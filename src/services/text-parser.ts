@@ -155,8 +155,7 @@ interface PdfLine {
 function buildPdfPageLines(
 	items: Array<{ str?: string; transform?: number[] }>,
 ): PdfLine[] {
-	let lastY: number | null = null;
-	let lastX: number | null = null;
+	let prev: PdfItemCursor | null = null;
 	let lineFontSize = 0;
 	const lineBuffer: string[] = [];
 	const lines: PdfLine[] = [];
@@ -173,33 +172,89 @@ function buildPdfPageLines(
 		const str = item.str;
 		if (!str) continue;
 
-		const transform = item.transform;
-		const x = transform?.[4] ?? 0;
-		const y = transform?.[5] ?? 0;
-		const fontSize = transform?.[0] ?? 12;
+		const metrics = readPdfItemMetrics(item);
+		const boundary = classifyPdfItemBoundary(
+			prev,
+			metrics,
+			lineBuffer.length > 0,
+		);
 
-		if (lastY !== null && Math.abs(y - lastY) > fontSize * 0.5) {
+		if (boundary === "line") {
 			flushLine();
-		} else if (
-			lastX !== null &&
-			x - lastX > fontSize * 0.3 &&
-			lineBuffer.length > 0
-		) {
+		} else if (boundary === "gap") {
 			const last = lineBuffer[lineBuffer.length - 1];
 			if (last && !last.endsWith(" ")) lineBuffer.push(" ");
 		}
 
 		lineBuffer.push(str);
-		lineFontSize = Math.max(lineFontSize, fontSize);
-		lastY = y;
-		lastX = x + str.length * fontSize * 0.5;
+		lineFontSize = Math.max(lineFontSize, metrics.fontSize);
+		prev = advancePdfItemCursor(metrics, str);
 	}
 
 	flushLine();
 	return lines;
 }
 
-function hasStr(item: unknown): item is { str: string; transform?: number[] } {
+// ── Shared PDF text-item layout heuristics ─────────────────────────────────
+//
+// pdf.js text items carry no word or line breaks of their own, so both the
+// line builder above and the search index below have to infer them from
+// geometry. Keeping that inference in one place is what guarantees the two
+// agree about where one word ends and the next begins.
+
+interface PdfItemMetrics {
+	x: number;
+	y: number;
+	fontSize: number;
+}
+
+/** Previous item's baseline y and estimated right edge. */
+interface PdfItemCursor {
+	endX: number;
+	y: number;
+}
+
+function readPdfItemMetrics(item: { transform?: number[] }): PdfItemMetrics {
+	const transform = item.transform;
+	return {
+		x: transform?.[4] ?? 0,
+		y: transform?.[5] ?? 0,
+		fontSize: transform?.[0] ?? 12,
+	};
+}
+
+function advancePdfItemCursor(
+	metrics: PdfItemMetrics,
+	str: string,
+): PdfItemCursor {
+	return {
+		endX: metrics.x + str.length * metrics.fontSize * 0.5,
+		y: metrics.y,
+	};
+}
+
+/**
+ * "line" = a big enough vertical jump to be a new line; "gap" = a horizontal
+ * gap wide enough to be a word break on the same line.
+ */
+function classifyPdfItemBoundary(
+	prev: PdfItemCursor | null,
+	metrics: PdfItemMetrics,
+	hasBuffered: boolean,
+): "line" | "gap" | "none" {
+	if (prev === null) return "none";
+	if (Math.abs(metrics.y - prev.y) > metrics.fontSize * 0.5) return "line";
+	if (metrics.x - prev.endX > metrics.fontSize * 0.3 && hasBuffered)
+		return "gap";
+	return "none";
+}
+
+function hasStr(item: unknown): item is {
+	str: string;
+	transform?: number[];
+	width?: number;
+	height?: number;
+} {
 	return typeof item === "object" && item !== null && "str" in item;
 }
 
@@ -224,6 +279,237 @@ export async function extractPdfPageText(page: PDFPageProxy): Promise<string> {
 	const content = await page.getTextContent();
 	const lines = buildPdfPageLines((content.items as unknown[]).filter(hasStr));
 	return cleanText(lines.map((l) => l.text).join("\n"));
+}
+
+// ── In-page search & highlighting ──────────────────────────────────────────
+
+export interface PdfTextItemLike {
+	str: string;
+	transform?: number[];
+	width?: number;
+	height?: number;
+}
+
+/** Where one character of the search text came from; null for a synthesized space, which has no glyph to highlight. */
+type PdfSearchCharSource = { itemIndex: number; offset: number } | null;
+
+export interface PdfPageSearchIndex {
+	/**
+	 * Case-folded page text with line wraps and word gaps alike collapsed to
+	 * single spaces, so a phrase still matches when it wraps mid-line.
+	 */
+	text: string;
+	/** One entry per character of `text`, mapping it back to the glyph it came from. */
+	charMap: PdfSearchCharSource[];
+	items: PdfTextItemLike[];
+}
+
+/** A highlight box as fractions (0–1) of the page, so it survives any render scale or panel width unchanged. */
+export interface PdfHighlightRect {
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+}
+
+/** The parts of a pdf.js viewport the rect math needs; kept structural so tests can supply a plain object. */
+export interface PdfHighlightViewport {
+	transform: number[];
+	width: number;
+	height: number;
+	scale?: number;
+}
+
+/**
+ * Lowercases per code unit rather than via a plain `toLowerCase()` on the
+ * whole string: a handful of characters (e.g. "İ") fold to two characters,
+ * which would shift every following index out of step with `charMap`.
+ */
+function foldCase(text: string): string {
+	let out = "";
+	for (const ch of text.split("")) {
+		const lower = ch.toLowerCase();
+		out += lower.length === 1 ? lower : ch;
+	}
+	return out;
+}
+
+const WORD_CHAR = /[\p{L}\p{N}_]/u;
+
+function isWordChar(ch: string | undefined): boolean {
+	return ch !== undefined && WORD_CHAR.test(ch);
+}
+
+export function buildPdfPageSearchIndexFromItems(
+	items: PdfTextItemLike[],
+): PdfPageSearchIndex {
+	let text = "";
+	const charMap: PdfSearchCharSource[] = [];
+	let prev: PdfItemCursor | null = null;
+
+	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+		const item = items[itemIndex];
+		const str = item.str;
+		if (!str) continue;
+
+		const metrics = readPdfItemMetrics(item);
+		// A wrap and a word gap are both just a space here — that's what lets a
+		// query match across a line break.
+		if (
+			classifyPdfItemBoundary(prev, metrics, text.length > 0) !== "none" &&
+			text.length > 0 &&
+			!text.endsWith(" ")
+		) {
+			text += " ";
+			charMap.push(null);
+		}
+
+		const folded = foldCase(str);
+		for (let offset = 0; offset < folded.length; offset++) {
+			text += folded[offset];
+			charMap.push({ itemIndex, offset });
+		}
+		prev = advancePdfItemCursor(metrics, str);
+	}
+
+	return { text, charMap, items };
+}
+
+export async function buildPdfPageSearchIndex(
+	page: PDFPageProxy,
+): Promise<PdfPageSearchIndex> {
+	const content = await page.getTextContent();
+	return buildPdfPageSearchIndexFromItems(
+		(content.items as unknown[]).filter(hasStr),
+	);
+}
+
+/**
+ * Every occurrence of `query` in an already-case-folded index text, as
+ * [start, end) ranges. With `wholeWord`, a hit only counts when neither
+ * neighbouring character is a letter/digit/underscore — checked directly
+ * rather than with `\b`, which is ASCII-only in JavaScript.
+ */
+export function findMatchRanges(
+	text: string,
+	query: string,
+	wholeWord: boolean,
+): Array<[number, number]> {
+	const needle = foldCase(query.trim());
+	if (!needle) return [];
+
+	const ranges: Array<[number, number]> = [];
+	let from = 0;
+	while (from <= text.length - needle.length) {
+		const start = text.indexOf(needle, from);
+		if (start === -1) break;
+		const end = start + needle.length;
+		if (
+			!wholeWord ||
+			(!isWordChar(text[start - 1]) && !isWordChar(text[end]))
+		) {
+			ranges.push([start, end]);
+		}
+		from = start + 1;
+	}
+	return ranges;
+}
+
+/** Same maths as pdfjs `Util.transform`, inlined so the rect helpers stay pure and synchronously testable. */
+function multiplyTransform(m1: number[], m2: number[]): number[] {
+	return [
+		m1[0] * m2[0] + m1[2] * m2[1],
+		m1[1] * m2[0] + m1[3] * m2[1],
+		m1[0] * m2[2] + m1[2] * m2[3],
+		m1[1] * m2[2] + m1[3] * m2[3],
+		m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+		m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+	];
+}
+
+const clamp01 = (n: number): number => Math.max(0, Math.min(1, n));
+
+/**
+ * Box for the `[startOffset, endOffset)` slice of one item's string. The
+ * slice's extent is interpolated from the item's total width by character
+ * count — exact glyph advances aren't exposed, and for a highlight band the
+ * approximation is visually indistinguishable.
+ *
+ * Assumes an upright viewport (`transform` may scale/flip, as pdf.js's
+ * always does, but not rotate); on a rotated page the box would keep its
+ * origin but run the wrong way, so the result is clamped to the page.
+ */
+function itemSliceRect(
+	item: PdfTextItemLike,
+	startOffset: number,
+	endOffset: number,
+	viewport: PdfHighlightViewport,
+): PdfHighlightRect | null {
+	const transform = item.transform;
+	if (!transform || !viewport.width || !viewport.height) return null;
+
+	const m = multiplyTransform(viewport.transform, transform);
+	const fontHeight = Math.hypot(m[2], m[3]);
+	const totalWidth = (item.width ?? 0) * (viewport.scale ?? 1);
+	const len = item.str.length || 1;
+
+	const left = m[4] + (startOffset / len) * totalWidth;
+	const width = ((endOffset - startOffset) / len) * totalWidth;
+	// m[5] sits on the baseline; the glyph body rises from there.
+	const top = m[5] - fontHeight;
+
+	if (width <= 0 || fontHeight <= 0) return null;
+	return {
+		left: clamp01(left / viewport.width),
+		top: clamp01(top / viewport.height),
+		width: clamp01(width / viewport.width),
+		height: clamp01(fontHeight / viewport.height),
+	};
+}
+
+/**
+ * Turns match ranges into highlight boxes. A range covering more than one
+ * item — because it spans a word gap or a line wrap — yields one box per
+ * item, so a wrapped phrase is highlighted on both lines.
+ */
+export function rangesToRects(
+	index: PdfPageSearchIndex,
+	ranges: Array<[number, number]>,
+	viewport: PdfHighlightViewport,
+): PdfHighlightRect[] {
+	const rects: PdfHighlightRect[] = [];
+
+	for (const [start, end] of ranges) {
+		let runItem = -1;
+		let runStart = 0;
+		let runEnd = 0;
+
+		const flush = () => {
+			if (runItem < 0) return;
+			const rect = itemSliceRect(
+				index.items[runItem],
+				runStart,
+				runEnd,
+				viewport,
+			);
+			if (rect) rects.push(rect);
+			runItem = -1;
+		};
+
+		for (let i = start; i < end; i++) {
+			const source = index.charMap[i];
+			if (!source) continue; // synthesized space — nothing drawn for it
+			if (source.itemIndex !== runItem) {
+				flush();
+				runItem = source.itemIndex;
+				runStart = source.offset;
+			}
+			runEnd = source.offset + 1;
+		}
+		flush();
+	}
+
+	return rects;
 }
 
 const CHAPTER_HEADING_PATTERN =

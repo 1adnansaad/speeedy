@@ -25,9 +25,13 @@ import {
 } from "../services/storage-service.js";
 import {
 	applyBionicReading,
+	buildPdfPageSearchIndex,
 	extractPdfPageText,
+	findMatchRanges,
 	loadPdfJs,
+	type PdfHighlightRect,
 	type PdfOutlineEntry,
+	rangesToRects,
 	resolvePdfOutline,
 } from "../services/text-parser.js";
 import { applyTheme } from "../services/theme-service.js";
@@ -104,6 +108,14 @@ export class RsvpReader extends LitElement {
 	@state() private pdfSearchMatches: number[] = [];
 	@state() private pdfSearchActiveIndex = -1;
 	@state() private pdfSearchLoading = false;
+	/** "Match whole word" toggle for Find in PDF; persisted like the panel width. */
+	@state() private pdfSearchWholeWord = false;
+	/**
+	 * Highlight boxes per page, as page fractions. Reassigned (never mutated
+	 * in place) so Lit picks the change up, and rendered declaratively so the
+	 * desktop sidebar and mobile sheet stay in sync for free.
+	 */
+	@state() private pdfHighlights = new Map<number, PdfHighlightRect[]>();
 	@state() private showChaptersPanel = false;
 	/** Whether the current PDF has a resolvable outline — drives the Chapters button's disabled state. */
 	@state() private pdfHasOutline = false;
@@ -111,6 +123,14 @@ export class RsvpReader extends LitElement {
 	private _pdfOutline: PdfOutlineEntry[] = [];
 	/** Extracted page text, cached so re-searching or re-opening the jump-to-reader modal doesn't re-extract the same page. */
 	private _pdfPageTextCache = new Map<number, string>();
+	/**
+	 * Search-oriented page text (wraps collapsed to spaces), kept separate
+	 * from _pdfPageTextCache because that one must stay a literal substring of
+	 * the reader's document text for the jump-to-page anchor to resolve.
+	 */
+	private _pdfSearchTextCache = new Map<number, string>();
+	/** Pages whose highlights have already been computed for the current query. */
+	private _pdfHighlightedPages = new Set<number>();
 	private _pdfSearchedQuery = "";
 	private wasPlayingBeforeSeek = false;
 	private countdownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -445,6 +465,7 @@ export class RsvpReader extends LitElement {
 		this._closePdfSearch();
 		this._closeChaptersPanel();
 		this._pdfPageTextCache.clear();
+		this._pdfSearchTextCache.clear();
 		this._pdfOutline = [];
 		this.pdfHasOutline = false;
 		this.docTitle = doc.title;
@@ -634,6 +655,7 @@ export class RsvpReader extends LitElement {
 	private static readonly PDF_PANEL_MIN_WIDTH = 260;
 	private static readonly PDF_PANEL_MAX_WIDTH = 900;
 	private static readonly PDF_PANEL_WIDTH_KEY = "speeedy:pdf-panel-width";
+	private static readonly PDF_WHOLE_WORD_KEY = "speeedy:pdf-search-whole-word";
 	/** Keep at least this much room for the reader column so the panel can never swallow the window. */
 	private static readonly PDF_PANEL_MIN_READER_WIDTH = 420;
 	/** Arrow-key step for the keyboard-accessible resize handle. */
@@ -668,6 +690,8 @@ export class RsvpReader extends LitElement {
 		if (Number.isFinite(stored) && stored > 0) {
 			this.pdfPanelWidth = this._clampPdfPanelWidth(stored);
 		}
+		this.pdfSearchWholeWord =
+			localStorage.getItem(RsvpReader.PDF_WHOLE_WORD_KEY) === "true";
 	}
 
 	private _onPdfResizeStart = (e: PointerEvent): void => {
@@ -867,6 +891,7 @@ export class RsvpReader extends LitElement {
 			if (!pageNum) continue;
 			if (entry.isIntersecting) {
 				void this._renderPdfPageInto(pageNum, slot);
+				void this._ensurePdfHighlights(pageNum);
 			} else if (
 				Math.abs(pageNum - this.pdfPageNum) > RsvpReader.PDF_KEEP_WINDOW
 			) {
@@ -991,7 +1016,7 @@ export class RsvpReader extends LitElement {
 		}
 	}
 
-	/** Extracts (or reuses a cached copy of) one page's plain text — shared by the jump-to-reader modal and PDF search. */
+	/** Extracts (or reuses a cached copy of) one page's plain text, for the jump-to-reader modal. */
 	private async _getPdfPageText(pageNum: number): Promise<string> {
 		const cached = this._pdfPageTextCache.get(pageNum);
 		if (cached !== undefined) return cached;
@@ -1000,6 +1025,56 @@ export class RsvpReader extends LitElement {
 		const text = await extractPdfPageText(page);
 		this._pdfPageTextCache.set(pageNum, text);
 		return text;
+	}
+
+	/**
+	 * One page's text as the search sees it. Only the string is cached, not
+	 * the far heavier character→glyph index, which is rebuilt on demand for
+	 * the handful of pages actually on screen.
+	 */
+	private async _getPdfSearchText(pageNum: number): Promise<string> {
+		const cached = this._pdfSearchTextCache.get(pageNum);
+		if (cached !== undefined) return cached;
+		if (!this.pdfDocProxy) return "";
+		const page = await this.pdfDocProxy.getPage(pageNum);
+		const index = await buildPdfPageSearchIndex(page);
+		this._pdfSearchTextCache.set(pageNum, index.text);
+		return index.text;
+	}
+
+	/**
+	 * Computes highlight boxes for one page, if the current query hits it.
+	 * Rects come back as page fractions, so they need no recomputation when
+	 * the sidebar is resized or the canvas re-renders at a different scale.
+	 */
+	private async _ensurePdfHighlights(pageNum: number): Promise<void> {
+		if (!this._pdfSearchedQuery || !this.pdfDocProxy) return;
+		if (this._pdfHighlightedPages.has(pageNum)) return;
+		this._pdfHighlightedPages.add(pageNum);
+
+		const query = this._pdfSearchedQuery;
+		const wholeWord = this.pdfSearchWholeWord;
+		const page = await this.pdfDocProxy.getPage(pageNum);
+		const index = await buildPdfPageSearchIndex(page);
+		const ranges = findMatchRanges(index.text, query, wholeWord);
+		if (ranges.length === 0) return;
+
+		// The query may have changed while getPage/getTextContent were in
+		// flight — drop stale work rather than painting the wrong highlights.
+		if (
+			this._pdfSearchedQuery !== query ||
+			this.pdfSearchWholeWord !== wholeWord
+		)
+			return;
+
+		const rects = rangesToRects(index, ranges, page.getViewport({ scale: 1 }));
+		if (rects.length === 0) return;
+		this.pdfHighlights = new Map(this.pdfHighlights).set(pageNum, rects);
+	}
+
+	private _clearPdfHighlights(): void {
+		this._pdfHighlightedPages.clear();
+		if (this.pdfHighlights.size > 0) this.pdfHighlights = new Map();
 	}
 
 	/** Token indices matching the last-run "Find in PDF" query, so the jump modal can echo the search highlight. */
@@ -1060,11 +1135,42 @@ export class RsvpReader extends LitElement {
 		this.pdfSearchMatches = [];
 		this.pdfSearchActiveIndex = -1;
 		this._pdfSearchedQuery = "";
+		this._clearPdfHighlights();
+	}
+
+	private _toggleWholeWordSearch(): void {
+		this.pdfSearchWholeWord = !this.pdfSearchWholeWord;
+		localStorage.setItem(
+			RsvpReader.PDF_WHOLE_WORD_KEY,
+			String(this.pdfSearchWholeWord),
+		);
+		// Whole-word changes which pages match, so an existing result set is
+		// stale the moment it's flipped.
+		if (this.pdfSearchQuery.trim()) void this._runPdfSearch();
+		else this._clearPdfHighlights();
+	}
+
+	/**
+	 * Highlights pages already on screen. The prefetch observer covers pages
+	 * that scroll in later, but pages rendered before the search ran would
+	 * otherwise stay unmarked until they left and re-entered the viewport.
+	 */
+	private _highlightVisiblePdfPages(): void {
+		for (
+			let n = Math.max(1, this.pdfPageNum - RsvpReader.PDF_KEEP_WINDOW);
+			n <=
+			Math.min(this.pdfPageCount, this.pdfPageNum + RsvpReader.PDF_KEEP_WINDOW);
+			n++
+		) {
+			void this._ensurePdfHighlights(n);
+		}
 	}
 
 	private async _runPdfSearch(): Promise<void> {
-		const query = this.pdfSearchQuery.trim().toLowerCase();
-		this._pdfSearchedQuery = this.pdfSearchQuery.trim();
+		const query = this.pdfSearchQuery.trim();
+		this._pdfSearchedQuery = query;
+		// Any previous highlights belong to a different query.
+		this._clearPdfHighlights();
 		if (!query || !this.pdfDocProxy || this.pdfPageCount === 0) {
 			this.pdfSearchMatches = [];
 			this.pdfSearchActiveIndex = -1;
@@ -1073,9 +1179,12 @@ export class RsvpReader extends LitElement {
 		this.pdfSearchLoading = true;
 		const matches: number[] = [];
 		try {
+			// Same matcher the highlights use, so the page list and what gets
+			// drawn on the page can never disagree.
 			for (let n = 1; n <= this.pdfPageCount; n++) {
-				const text = await this._getPdfPageText(n);
-				if (text.toLowerCase().includes(query)) matches.push(n);
+				const text = await this._getPdfSearchText(n);
+				if (findMatchRanges(text, query, this.pdfSearchWholeWord).length > 0)
+					matches.push(n);
 			}
 		} finally {
 			this.pdfSearchLoading = false;
@@ -1084,6 +1193,7 @@ export class RsvpReader extends LitElement {
 		this.pdfSearchActiveIndex = matches.length > 0 ? 0 : -1;
 		if (matches.length > 0) {
 			this._jumpToPdfPage(matches[0]);
+			this._highlightVisiblePdfPages();
 		} else {
 			showToast("No matches found in this PDF.", "error");
 		}
@@ -1095,6 +1205,7 @@ export class RsvpReader extends LitElement {
 		this.pdfSearchActiveIndex =
 			(this.pdfSearchActiveIndex + delta + count) % count;
 		this._jumpToPdfPage(this.pdfSearchMatches[this.pdfSearchActiveIndex]);
+		this._highlightVisiblePdfPages();
 	}
 
 	private _handlePdfSearchEnter(shiftKey: boolean): void {
@@ -1635,11 +1746,12 @@ export class RsvpReader extends LitElement {
 								(n) => n,
 								(n) => html`
 							<div
-								class="pdf-page-slot w-full mb-2"
+								class="pdf-page-slot relative w-full mb-2"
 								data-page="${n}"
 								style="aspect-ratio: ${1 / this.pdfPageAspectRatio};"
 							>
 								<canvas class="pdf-canvas w-full h-full block shadow"></canvas>
+								${this.renderPdfHighlightLayer(n)}
 							</div>
 						`,
 							)
@@ -1674,6 +1786,18 @@ export class RsvpReader extends LitElement {
 							}
 						}}
 					/>
+					<button
+						type="button"
+						class="btn btn-ghost btn-xs shrink-0 px-1.5 font-semibold leading-none ${
+							this.pdfSearchWholeWord
+								? "bg-base-200 text-base-content"
+								: "text-base-content/50"
+						}"
+						@click=${() => this._toggleWholeWordSearch()}
+						title="Match whole word"
+						aria-label="Match whole word"
+						aria-pressed=${this.pdfSearchWholeWord}
+					>ab<span class="opacity-60">|</span></button>
 					${
 						this.pdfSearchLoading
 							? html`<span class="loading loading-spinner loading-xs shrink-0"></span>`
@@ -1865,6 +1989,26 @@ export class RsvpReader extends LitElement {
 						</div>
 					</div>
 				</div>
+			</div>
+		`;
+	}
+
+	/**
+	 * Search hits drawn over a page's canvas. Boxes are page fractions, so
+	 * `%` positioning makes them track the canvas through any panel width or
+	 * render scale without being recomputed.
+	 */
+	private renderPdfHighlightLayer(pageNum: number) {
+		const rects = this.pdfHighlights.get(pageNum);
+		if (!rects || rects.length === 0) return nothing;
+		return html`
+			<div class="pdf-highlight-layer absolute inset-0 pointer-events-none" aria-hidden="true">
+				${rects.map(
+					(rect) => html`<div
+						class="absolute bg-warning/45 mix-blend-multiply rounded-[1px]"
+						style="left:${(rect.left * 100).toFixed(3)}%;top:${(rect.top * 100).toFixed(3)}%;width:${(rect.width * 100).toFixed(3)}%;height:${(rect.height * 100).toFixed(3)}%"
+					></div>`,
+				)}
 			</div>
 		`;
 	}
